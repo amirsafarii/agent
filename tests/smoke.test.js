@@ -100,12 +100,12 @@ test('buildAgent: wires the full stack with default tools and memory', () => {
   assert.equal(agent.sessionId, 'smoke-1');
   assert.equal(agent.memoryBackend, 'in-process', 'memory on by default, in-process without Redis');
   assert.ok(agent.systemPrompt.includes('ScrappyAi'), 'built-in system prompt resolved');
-  assert.match(agent.systemPrompt, /ANTI-LAZINESS/, 'anti-laziness (Rule Zero) is in the system prompt');
-  assert.match(agent.systemPrompt, /Fallback Rule/, 'fallback rule is in the system prompt');
+  assert.match(agent.systemPrompt, /RULE ZERO/, 'quality gates (Rule Zero) is in the system prompt');
+  assert.match(agent.systemPrompt, /FALLBACK RULE/i, 'fallback rule is in the system prompt');
   assert.ok(agent.reasoner.getHistory, 'reasoner exposes history');
   assert.ok(agent.checkpoints, 'checkpoint manager attached');
   assert.ok(agent.strictFinal, 'strictFinal gate enabled by default');
-  assert.equal(agent.maxToolCallsPerTool, 12, 'tool-overuse guard defaults to 12');
+  assert.equal(agent.maxToolCallsPerTool, 20, 'tool-overuse guard defaults to 20');
 });
 
 test('buildAgent: runs one full turn end to end through the real 9router client', async () => {

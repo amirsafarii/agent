@@ -643,16 +643,17 @@ function buildErrorInfo(code, message) {
   return { code, message, retryable };
 }
 
-/** Codes a retry can plausibly fix. */
+/**
+ * Codes a retry can plausibly fix. MUST NOT include network/timeout/DNS
+ * errors (ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENOTFOUND, REQUEST_FAILED,
+ * TIMEOUT) — these indicate a dead endpoint where retrying wastes latency
+ * and tokens. The system prompt's Fallback Rule and the loop-level
+ * DEFAULT_TOOL_RETRY both enforce fail-fast so the reasoner pivots
+ * immediately instead of burning budget on a dead endpoint.
+ */
 const RETRYABLE_ERROR_CODES = new Set([
   'TOOL_EXECUTION_ERROR',
   'EXECUTION_ERROR',
-  'ECONNRESET',
-  'ECONNREFUSED',
-  'ETIMEDOUT',
-  'ENOTFOUND',
-  'REQUEST_FAILED',
-  'TIMEOUT',
 ]);
 
 /**

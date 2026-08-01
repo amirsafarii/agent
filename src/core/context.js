@@ -67,6 +67,8 @@ export class ContextWindow {
     this.messages = [];
     /** @type {Array<{message: ContextMessage, reason:string, ts:number}>} audit trail of compacted-away entries */
     this.dropped = [];
+    /** Prevents futile repeated compaction attempts when keepRecent alone exceeds budget */
+    this._lastCompactFailed = false;
   }
 
   /** Total estimated tokens currently held (messages only, not systemPrompt). */
@@ -102,7 +104,10 @@ export class ContextWindow {
       budgetFraction: Number(this.budgetFraction.toFixed(3)),
     });
 
-    if (this.budgetFraction >= this.compactThreshold) {
+    // Only attempt compaction if we're over the threshold AND haven't just
+    // tried to compact (prevents futile repeated compaction attempts when
+    // keepRecent alone exceeds the budget).
+    if (this.budgetFraction >= this.compactThreshold && !this._lastCompactFailed) {
       await this._compact();
     }
     return entry;
@@ -156,6 +161,7 @@ export class ContextWindow {
 
     if (compactCandidates.length === 0) {
       log.warn('compact:skip', { reason: 'nothing eligible, over budget but all protected', usedTokens: beforeTokens });
+      this._lastCompactFailed = true;
       return; // nothing eligible to compact; over budget but protected
     }
 
@@ -173,6 +179,7 @@ export class ContextWindow {
           this.dropped.push({ message: m, reason: 'summarized', ts: Date.now() });
         }
         this.messages = [summaryEntry, ...recent];
+        this._lastCompactFailed = false;
         log.info('compact:done', {
           strategy: 'summarize',
           summarizedCount: compactCandidates.length,
@@ -194,11 +201,15 @@ export class ContextWindow {
       this.dropped.push({ message: removed, reason: 'dropped_for_budget', ts: Date.now() });
     }
     this.messages = [...candidates, ...recent];
+    // If compaction didn't actually reduce usage below the threshold, mark
+    // as failed so we don't keep retrying on every append.
+    this._lastCompactFailed = this.budgetFraction >= this.compactThreshold;
     log.info('compact:done', {
       strategy: 'drop',
       droppedCount: this.dropped.length,
       beforeTokens,
       afterTokens: this.usedTokens,
+      stillOverBudget: this._lastCompactFailed,
     });
   }
 
@@ -232,6 +243,7 @@ export class ContextWindow {
   clear() {
     this.messages = [];
     this.dropped = [];
+    this._lastCompactFailed = false;
   }
 
   /**

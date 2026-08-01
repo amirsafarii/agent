@@ -74,7 +74,13 @@ export class BudgetManager {
   }
 
   get usage() {
-    return { ...this._usage };
+    return {
+      ...this._usage,
+      // runtimeMs always reflects actual wall-clock elapsed time, not the
+      // additive counter from record() calls. This ensures usage.runtimeMs
+      // is consistent with the exceeded() check (which also uses wall-clock).
+      runtimeMs: Date.now() - this._usage.startedAt,
+    };
   }
 
   get startedAt() {
