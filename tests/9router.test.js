@@ -173,3 +173,41 @@ test('serializes the native tool-call history into OpenAI tool messages', async 
   assert.equal(msgs[2].role, 'tool');
   assert.equal(msgs[2].tool_call_id, 'c1');
 });
+
+test('regression: assistant tool-call turns with empty content serialize to "" not null', async () => {
+  // The reasoner stores an assistant tool-call turn as content:'' (no text,
+  // only tool_calls). The previous toOpenAiMessages did `content || null`,
+  // collapsing '' into JSON null — which DeepSeek rejects with
+  // "invalid type: null, expected a string" and crashes the whole turn.
+  const client = createNineRouterClient(BASE);
+  await client.chat({
+    messages: [
+      { role: 'user', content: 'compute' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', name: 'add', args: { a: 1 } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '3' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c2', name: 'mul', args: { a: 3 } }] },
+      { role: 'tool', tool_call_id: 'c2', content: '9' },
+    ],
+  });
+  const msgs = lastRequest.body.messages;
+  for (const m of msgs) {
+    assert.notEqual(m.content, null, `no message may have content:null (got ${JSON.stringify(m)})`);
+  }
+  assert.equal(msgs[1].content, '', 'empty-text tool-call turn stays an empty string');
+  assert.equal(msgs[3].content, '', 'empty-text tool-call turn stays an empty string');
+});
+
+test('regression: no provider message ever carries a null/undefined content', async () => {
+  const client = createNineRouterClient(BASE);
+  const weird = [
+    { role: 'user', content: '' },
+    { role: 'assistant', content: null },
+    { role: 'tool', tool_call_id: 't1', content: undefined },
+    { role: 'system', content: 'sys' },
+  ];
+  await client.chat({ messages: weird });
+  const msgs = lastRequest.body.messages;
+  for (const m of msgs) {
+    assert.equal(typeof m.content, 'string', `content must be a string, got ${JSON.stringify(m)}`);
+  }
+});
