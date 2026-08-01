@@ -10,12 +10,19 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { execa } from 'execa';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('verification:validators');
 
 /**
  * Validate path resolution inside sandbox root.
+ *
+ * The boundary check compares against `resolvedRoot + path.sep` (with an
+ * exact-match exception for the root itself): a bare startsWith(root) check
+ * is NOT sufficient, because "/workspace/root-evil/x" starts with
+ * "/workspace/root" — that sibling-prefix bug would let "../root-evil/..."
+ * escape the sandbox while looking legal.
+ *
  * @param {string} rootDir
  * @param {string} relPath
  * @returns {string} resolved path
@@ -35,7 +42,8 @@ export function assertPathInSandbox(rootDir, relPath) {
     resolved = path.resolve(resolvedRoot, relPath);
   }
 
-  if (!resolved.startsWith(resolvedRoot)) {
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
+  if (resolved !== resolvedRoot && !resolved.startsWith(rootWithSep)) {
     const err = new Error(`Path escape detected: "${relPath}" is outside sandbox root "${resolvedRoot}".`);
     err.code = 'PATH_ESCAPE';
     throw err;

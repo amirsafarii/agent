@@ -4,29 +4,35 @@ Minimal, dependency-free agent core. Pure JavaScript (ES modules) — no TypeScr
 
 ```
 src/
-├── loop.js                 ← the heart: think → act → observe (AgentLoop)
-│                              + state machine, stop-condition engine, checkpoints,
-│                                pause/resume, tool-approval gate
-├── tools.js                ← tool registry: validation, timeout, safe errors (ToolRegistry)
-├── context.js              ← context window: token budget + auto-compaction (ContextWindow)
-├── reasoner.js             ← pluggable LLM adapter + native tool_call_id history,
-│                              + streaming (createReasoner)
-├── planning.js             ← multi-step execution plans and subtask tracking (PlanningEngine)
-├── planning/               ← DAG, goal-decomposer, task-tree, dag-executor
-├── verification.js         ← file/command/JSON/suite validation checks (VerificationEngine)
-├── verification/           ← verification-pipeline, validators
-├── checkpoint-manager.js   ← every checkpoint addressable by id, in memory + on disk
-├── session-logger.js       ← per-session events.jsonl + transcript.log on disk
-├── trace.js                ← Claude-Code-style colored terminal trace + scratchpad renderer
-├── logger.js               ← one structured logger everywhere (redaction built in)
-├── repl.js                 ← multi-turn REPL (/help /history /scratchpad /system /reset
-│                              /approve /deny /exit)
 ├── index.js                ← buildAgent() wiring: tools + 9router + memory + session log
-├── memory-integration.js   ← [memory] injection before each turn, recording after
+├── core/
+│   ├── loop/               ← the heart: think → act → observe (AgentLoop)
+│   │   ├── agent-loop.js      orchestrator: guards, retry, adaptive budget, approval gate
+│   │   ├── state-machine.js   LoopState + LoopStateMachine (audited transitions)
+│   │   ├── stop-conditions.js prioritized Stop Condition Engine
+│   │   ├── events.js          LoopEvents / TerminationReason / ActionType
+│   │   ├── errors.js          LoopError
+│   │   └── compression.js     tool-result compression + shared helpers
+│   ├── context.js          ← context window: token budget + auto-compaction (ContextWindow)
+│   ├── reasoner.js         ← pluggable LLM adapter + native tool_call_id history,
+│   │                          + streaming (createReasoner)
+│   ├── checkpoint-manager.js ← every checkpoint addressable by id, in memory + on disk
+│   ├── session-logger.js   ← per-session events.jsonl + transcript.log on disk
+│   ├── trace.js            ← Claude-Code-style colored terminal trace + scratchpad renderer
+│   ├── logger.js           ← one structured logger everywhere (redaction built in)
+│   └── repl.js             ← multi-turn REPL (/help /history /scratchpad /system /reset
+│                              /approve /deny /exit)
 ├── clients/9router.js      ← OpenAI-compatible chat + chatStream (SSE) adapter
-├── tools/{shell,files,search,code,package,planning,verification}.js
+├── tools/
+│   ├── registry.js         ← tool registry: validation, timeout, safe errors (ToolRegistry)
+│   └── {filesystem,shell,code,package,planning,verification,search}.js
+├── planning/               ← engine.js (PlanningEngine) + DAG, goal-decomposer,
+│                              task-tree, dag-executor
+├── verification/           ← engine.js (VerificationEngine) + verification-pipeline,
+│                              validators
 └── memory/                 ← seven-layer memory (session/workspace/episodic/semantic/
-                               long-term/tool/project), in-process or Redis
+│                              long-term/tool/project), in-process or Redis
+└── integration.js          ← [memory] injection before each turn, recording after
 tests/
 ├── smoke.test.js           ← buildAgent() end to end, loadSystemPrompt, abort signal
 ├── reasoner.test.js        ← createReasoner + scripted client
@@ -42,6 +48,8 @@ tests/
 ├── streaming.test.js       ← chatStream SSE accumulation + streamed AgentLoop turns
 ├── logger.test.js          ← redaction + clipping
 └── repl.test.js            ← REPL commands + /approve /deny + streamed answers
+docs/
+└── LOOP.md                 ← full loop input/output schema (states, actions, results)
 ```
 
 ## Run tests
@@ -70,9 +78,9 @@ tool-calling APIs that require the tool result to echo back the matching `tool_c
 ### Quick and dirty: a raw reasoner function
 
 ```js
-import { AgentLoop } from './src/loop.js';
-import { ToolRegistry } from './src/tools.js';
-import { ContextWindow } from './src/context.js';
+import { AgentLoop } from './src/core/loop/index.js';
+import { ToolRegistry } from './src/tools/index.js';
+import { ContextWindow } from './src/core/context.js';
 
 const tools = new ToolRegistry();
 tools.register({
@@ -96,7 +104,7 @@ const result = await loop.run('find me something');
 console.log(result);
 ```
 
-### Recommended: `createReasoner()` from `src/reasoner.js`
+### Recommended: `createReasoner()` from `src/core/reasoner.js`
 
 This is the provider-agnostic adapter layer: you write a small `client.chat({ systemPrompt, messages, tools })`
 function for your actual LLM (OpenAI, Anthropic, local model), and `createReasoner()` handles
@@ -104,10 +112,10 @@ normalizing its output into an `Action`, retrying transient failures, and mainta
 native `tool_call_id`-correlated history the loop needs for multi-turn tool use.
 
 ```js
-import { AgentLoop } from './src/loop.js';
-import { ToolRegistry } from './src/tools.js';
-import { ContextWindow } from './src/context.js';
-import { createReasoner } from './src/reasoner.js';
+import { AgentLoop } from './src/core/loop/index.js';
+import { ToolRegistry } from './src/tools/index.js';
+import { ContextWindow } from './src/core/context.js';
+import { createReasoner } from './src/core/reasoner.js';
 
 const client = {
   async chat({ systemPrompt, messages, tools }) {
@@ -129,7 +137,7 @@ const loop = new AgentLoop({
 const result = await loop.run('find me something');
 ```
 
-For wiring/dev without a real LLM yet, `createScriptedClient([...responses])` from `src/reasoner.js`
+For wiring/dev without a real LLM yet, `createScriptedClient([...responses])` from `src/core/reasoner.js`
 plays back a fixed sequence of responses — see `tests/reasoner.test.js`.
 
 ## Running it end to end
@@ -307,7 +315,7 @@ order: an explicit override passed to `buildAgent({ systemPrompt })` > `SCRAPPYA
 (path to a text file, for long prompts) > `SCRAPPYAI_SYSTEM_PROMPT` (inline, for short ones) >
 the built-in default. See `.env.example`.
 
-### Memory (src/memory/, wired in via src/memory-integration.js)
+### Memory (src/memory/, wired in via src/memory/integration.js)
 
 `buildAgent()` now attaches a full seven-layer memory system by default —
 **session**, **workspace**, **episodic**, **semantic**, **long-term**,
@@ -374,11 +382,11 @@ default — tells the model how to treat the `[memory]` system message it
 will now sometimes see (ground truth already known, use it, do not
 re-ask for it, never contradict a confirmed fact silently).
 
-### Logging (src/logger.js)
+### Logging (src/core/logger.js)
 
-One structured logger, used by every component — `loop.js`, `tools.js`,
-`context.js`, `reasoner.js`, `clients/9router.js`, `index.js`, `repl.js`,
-`tools/{shell,files,search}.js`, `memory-integration.js`, and (via a thin
+One structured logger, used by every component — `core/loop/`, `tools/`,
+`core/context.js`, `core/reasoner.js`, `clients/9router.js`, `index.js`,
+`core/repl.js`, `memory/integration.js`, and (via a thin
 compat shim so its call sites didn't need rewriting) every memory layer
 under `src/memory/`. There is exactly one logging mechanism in the codebase
 now — no more ad hoc `console.error` sprinkled in `index.js` alongside the
@@ -514,8 +522,8 @@ Two real bugs made "turn memory" silently fail:
 
 ## Roadmap
 
-1. ✅ `reasoner.js` + the two-line `loop.js` hook
-2. ✅ `tools/shell.js`, `tools/files.js`, `tools/search.js`, `clients/9router.js`, `index.js` (this repo, done and tested)
+1. ✅ `core/reasoner.js` + the two-line loop hook
+2. ✅ `tools/shell.js`, `tools/filesystem.js`, `tools/search.js`, `clients/9router.js`, `index.js` (this repo, done and tested)
 3. ✅ A proper system prompt (built-in default rewritten — see "System prompt")
 4. ✅ Streaming (`chatStream` SSE client + streamed reasoner + `SCRAPPYAI_STREAM` CLI/REPL)
 

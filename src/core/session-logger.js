@@ -63,7 +63,7 @@ export class SessionLogger {
     return entry;
   }
 
-  /** Record a full StepRecord (see LOOP.md) exactly as AgentLoop produced it — nothing trimmed. */
+  /** Record a full StepRecord (see docs/LOOP.md) exactly as AgentLoop produced it — nothing trimmed. */
   logStep(record) {
     return this.log('step_record', record, 'loop');
   }
@@ -121,7 +121,7 @@ function safeJson(value) {
  * Wire a SessionLogger onto an AgentLoop instance: forwards every onEvent
  * call and every recorded step to it, without replacing an existing
  * onEvent (both fire). Returns the loop for chaining.
- * @param {import('./loop.js').AgentLoop} loop
+ * @param {import('./loop/index.js').AgentLoop} loop
  * @param {SessionLogger} sessionLogger
  */
 export function attachSessionLogger(loop, sessionLogger) {

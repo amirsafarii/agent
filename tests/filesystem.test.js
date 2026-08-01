@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry } from '../src/tools.js';
+import { ToolRegistry } from '../src/tools/index.js';
 import { createFilesystemTools } from '../src/tools/filesystem.js';
 
 function setup() {
@@ -164,8 +164,8 @@ test('delete_file and the approval gate: a loop pauses for approval before delet
   const { root } = setup();
   await (await import('node:fs/promises')).writeFile(join(root, 'keep.txt'), 'x');
 
-  const { AgentLoop } = await import('../src/loop.js');
-  const { ContextWindow } = await import('../src/context.js');
+  const { AgentLoop } = await import('../src/core/loop/index.js');
+  const { ContextWindow } = await import('../src/core/context.js');
 
   let calls = 0;
   const registry2 = new ToolRegistry();

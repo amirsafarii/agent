@@ -8,7 +8,7 @@
 
 import { DAG } from './dag.js';
 import { TaskTree } from './task-tree.js';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('planning:decomposer');
 

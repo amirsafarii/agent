@@ -1,8 +1,12 @@
 /**
- * src/verification.js — Verification Engine for ScrappyAi
+ * verification/engine.js — Verification Engine for ScrappyAi
  * --------------------------------------------------------
  * Engine for automated verification and assertion checks on files, commands,
  * syntax, and structured outputs to ensure work meets quality criteria.
+ * The staged-pipeline runner and the standalone validators live in sibling
+ * modules and are re-exported together with this engine from
+ * verification/index.js; sandbox path resolution is shared via
+ * validators.js's assertPathInSandbox().
  *
  * Supported check types:
  *   - file_exists: asserts file or directory presence
@@ -17,10 +21,8 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { execa } from 'execa';
-import { createLogger } from './logger.js';
-import { VerificationPipeline, validateFile, validateCommand, validateJson, assertPathInSandbox } from './verification/index.js';
-
-export { VerificationPipeline, validateFile, validateCommand, validateJson, assertPathInSandbox };
+import { createLogger } from '../core/logger.js';
+import { assertPathInSandbox } from './validators.js';
 
 const log = createLogger('verification');
 
@@ -36,21 +38,14 @@ export class VerificationEngine {
   }
 
   /**
-   * Resolve and enforce path inside sandbox root.
+   * Resolve and enforce path inside sandbox root. Delegates to the shared
+   * assertPathInSandbox() so every verification surface applies the exact
+   * same (sibling-prefix-safe) boundary check.
    * @param {string} relPath
    * @returns {string} resolved path
    */
   _resolvePath(relPath) {
-    if (!relPath || typeof relPath !== 'string') {
-      throw new Error('Path must be a non-empty string.');
-    }
-    const resolved = path.resolve(this.rootDir, relPath);
-    if (!resolved.startsWith(this.rootDir)) {
-      const err = new Error(`Path escape detected: "${relPath}" is outside sandbox root.`);
-      err.code = 'PATH_ESCAPE';
-      throw err;
-    }
-    return resolved;
+    return assertPathInSandbox(this.rootDir, relPath);
   }
 
   /**
@@ -302,12 +297,21 @@ export class VerificationEngine {
     let failed = 0;
 
     for (const check of checks) {
+      // Dispatch is type-first, shape-second. An explicit check.type always
+      // wins; otherwise infer from the payload. (The old shape-first order
+      // silently routed `type:'json'` checks that read from `path` to
+      // verifyFile instead of verifyJson.)
+      const type = check.type
+        || (check.command ? 'command' : null)
+        || (check.jsonString !== undefined || check.requiredKeys ? 'json' : null)
+        || (check.path ? 'file' : null);
+
       let res;
-      if (check.type === 'file' || check.path) {
+      if (type === 'file') {
         res = await this.verifyFile(check);
-      } else if (check.type === 'command' || check.command) {
+      } else if (type === 'command') {
         res = await this.verifyCommand(check);
-      } else if (check.type === 'json' || check.jsonString) {
+      } else if (type === 'json') {
         res = await this.verifyJson(check);
       } else {
         res = { ok: false, check: check.type || 'unknown', error: `Unrecognized check type or parameters.` };

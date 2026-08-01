@@ -1,8 +1,8 @@
-# LOOP.md — `src/loop.js`, the heart of ScrappyAi
+# LOOP.md — `src/core/loop/`, the heart of ScrappyAi
 
-سلام؛ همه‌ی موارد این فایل که اجرا می‌شود، با schema دقیق ورودی/خروجی نشان داده شده: چی می‌ره داخل، چی برمی‌گرده بیرون، و چرا. هدف این سند این‌ که هیچ رفتار پنهانی توی `loop.js` نباشد.
+سلام؛ همه‌ی موارد این فایل که اجرا می‌شود، با schema دقیق ورودی/خروجی نشان داده شده: چی می‌ره داخل، چی برمی‌گرده بیرون، و چرا. هدف این سند این‌ که هیچ رفتار پنهانی توی `core/loop/agent-loop.js` نباشد.
 
-`AgentLoop` یک چرخه‌ی `think → act → observe` است که سه چیز را ارکستره می‌کند: `ContextWindow` (`context.js`)، `ToolRegistry` (`tools.js`)، و یک تابع `reasoner` تزریقی (هیچ وابستگی به هیچ LLM provider خاصی داخل این فایل نیست).
+`AgentLoop` یک چرخه‌ی `think → act → observe` است که سه چیز را ارکستره می‌کند: `ContextWindow` (`core/context.js`)، `ToolRegistry` (`tools/registry.js`)، و یک تابع `reasoner` تزریقی (هیچ وابستگی به هیچ LLM provider خاصی داخل این فایل نیست).
 
 ---
 
@@ -94,7 +94,7 @@ type Action =
   | { type: 'need_clarification'; question: string; reasoning?: string };
 ```
 
-قوانین validation (`_validateAction`، در `loop.js`):
+قوانین validation (`_validateAction`، در `core/loop/agent-loop.js`):
 
 | فیلد | قانون |
 |---|---|
@@ -160,7 +160,7 @@ reasoner باید بلافاصله به ابزار دیگری (مثلاً `web_s
 
 ---
 
-## 5. Tool Result Schema (استاندارد) — از `tools.js`
+## 5. Tool Result Schema (استاندارد) — از `tools/registry.js`
 
 هر `ToolRegistry.execute()` دقیقاً این شکل را برمی‌گرداند (هیچ‌وقت throw نمی‌کند):
 
@@ -215,7 +215,7 @@ type StepRecord = {
 - `loop.getStepMemory()` → کپی از آرایه‌ی فعلی (حتی وسط یک run طولانی، برای مانیتورینگ زنده)
 - `LoopResult.stepMemory` → همان آرایه، در انتهای `run()`
 
-هر `run()` جدید، Step Memory را ریست می‌کند (`this._stepMemory = []`) — این حافظه‌ی *یک اجرا* است، نه حافظه‌ی بلندمدت (آن کار `context.js` و memory layers است).
+هر `run()` جدید، Step Memory را ریست می‌کند (`this._stepMemory = []`) — این حافظه‌ی *یک اجرا* است، نه حافظه‌ی بلندمدت (آن کار `core/context.js` و memory layers است).
 
 ---
 
@@ -322,7 +322,7 @@ getStateHistory() => Array<{from: LoopState|null, to: LoopState, at: number, met
 
 ## 12. Stop Condition Engine (`StopConditionEngine`, `loop.stopEngine`)
 
-قبل از این نسخه، چهار گارد (`abort_signal`, `task_timeout`, `max_tokens`, `custom stopConditions`) هرکدام یک `if` جدا در بدنه‌ی `run()` بودند. الان همه یک condition نام‌دار و اولویت‌دار داخل یک موتور واحدند — قابل inspect، register، unregister، بدون نیاز به دست‌زدن به کد `loop.js`.
+قبل از این نسخه، چهار گارد (`abort_signal`, `task_timeout`, `max_tokens`, `custom stopConditions`) هرکدام یک `if` جدا در بدنه‌ی `run()` بودند. الان همه یک condition نام‌دار و اولویت‌دار داخل یک موتور واحدند — قابل inspect، register، unregister، بدون نیاز به دست‌زدن به کد `core/loop/agent-loop.js`.
 
 ### شکل یک condition
 
@@ -506,7 +506,7 @@ AgentLoop.fromCheckpoint(checkpoint: Checkpoint, constructorOpts: AgentLoopConst
 
 - **هر** `LoopResult` (نه فقط `status:'paused'`) یک `checkpoint` معتبر همراه دارد — یعنی حتی از یک `final` یا `error` هم می‌شود «ادامه» گرفت (مثلاً بعد از final، یک `resume({additionalInput: '...'})` عملاً یک turn جدید روی همان context است).
 - `pause()` **cooperative** است: فقط در مرز بین step‌ها چک می‌شود، هرگز وسط یک tool call در حال اجرا قطع نمی‌کند.
-- `ContextWindow.restore()`/`ContextWindow.fromJSON()` (در `context.js`) دقیقاً همین‌جا استفاده می‌شوند: پیام‌ها را بدون re-validate یا token-re-estimate مستقیم برمی‌گردانند، چون از یک `toJSON()` قبلاً معتبر آمده‌اند.
+- `ContextWindow.restore()`/`ContextWindow.fromJSON()` (در `core/context.js`) دقیقاً همین‌جا استفاده می‌شوند: پیام‌ها را بدون re-validate یا token-re-estimate مستقیم برمی‌گردانند، چون از یک `toJSON()` قبلاً معتبر آمده‌اند.
 - `resume()`/`resumeWithApproval()` روی همان instance، `maxSteps`/`maxTaskTimeoutMs` را reset نمی‌کند — این دو همچنان سقف *کل عمر run* هستند، نه سقف هر تک‌فراخوانی.
 - یک checkpoint با `pendingApproval` ست‌شده فقط با `resumeWithApproval()` ادامه پیدا می‌کند؛ `resume()` روی چنین checkpointی خطای `PENDING_APPROVAL` می‌دهد (بخش ۱۵).
 
@@ -597,7 +597,7 @@ attachSessionLogger(loop: AgentLoop, sessionLogger: SessionLogger) => AgentLoop
 
 ---
 
-## 18. Trace Renderer — خروجی ترمینال تمیز به‌جای JSON خام (`trace.js`)
+## 18. Trace Renderer — خروجی ترمینال تمیز به‌جای JSON خام (`core/trace.js`)
 
 `createTraceRenderer()` رویدادهای خام `onEvent` را به یک ترنسکریپت رنگی، خوانا، شبیه Claude Code تبدیل می‌کند:
 
@@ -606,7 +606,7 @@ createTraceRenderer({ output?: NodeJS.WritableStream = process.stdout, color?: b
   => { onEvent: (event, payload) => void, colorEnabled: boolean }
 ```
 
-`● Thought` (فقط برای اکشن‌های غیر-tool_call)، `⚙ Tool Call`، `↻ retry`، `✔/✘` برای observe، `⏸ Awaiting Tool Approval`، `● Final Answer`، `● Clarification Needed`، `● Error` — همه با رنگ (auto-disable روی non-TTY یا `NO_COLOR`). `renderScratchpad(stepMemory)` هم کل Step Memory را به یک "Agent Scratchpad" شماره‌گذاری‌شده تبدیل می‌کند (مستقل از context فشرده‌شده). `index.js`/`repl.js` این‌ها را به‌جای `console.error(JSON.stringify(...))` قبلی استفاده می‌کنند؛ `/scratchpad` هم یک دستور REPL جدید است.
+`● Thought` (فقط برای اکشن‌های غیر-tool_call)، `⚙ Tool Call`، `↻ retry`، `✔/✘` برای observe، `⏸ Awaiting Tool Approval`، `● Final Answer`، `● Clarification Needed`، `● Error` — همه با رنگ (auto-disable روی non-TTY یا `NO_COLOR`). `renderScratchpad(stepMemory)` هم کل Step Memory را به یک "Agent Scratchpad" شماره‌گذاری‌شده تبدیل می‌کند (مستقل از context فشرده‌شده). `index.js`/`core/repl.js` این‌ها را به‌جای `console.error(JSON.stringify(...))` قبلی استفاده می‌کنند؛ `/scratchpad` هم یک دستور REPL جدید است.
 
 ---
 
@@ -650,7 +650,7 @@ createTraceRenderer({ output?: NodeJS.WritableStream = process.stdout, color?: b
 
 ## 20. Streaming — loop آگاه نیست، و نباید هم باشد
 
-Streaming عمداً بیرون از `loop.js` پیاده شده تا قرارداد `reasoner(rendered, toolSchema) => Action`
+Streaming عمداً بیرون از `core/loop/agent-loop.js` پیاده شده تا قرارداد `reasoner(rendered, toolSchema) => Action`
 دست‌نخورده بماند:
 
 - `clients/9router.js` متد دوم `chatStream({ systemPrompt, messages, tools, onDelta, signal })`
@@ -660,7 +660,7 @@ Streaming عمداً بیرون از `loop.js` پیاده شده تا قرارد
   ساخته شود. سه حالت دفاعی: بدنه‌ی JSON ساده (gateway ای که stream:true را نادیده می‌گیرد)
   همان‌طور پارس می‌شود؛ هر چیزی بعد از `data: [DONE]` نادیده گرفته می‌شود؛ و اگر هیچ آبجکت
   SSE‌ای نرسد، همان `parseJsonResponse` دفاعی مسیر `chat()` استفاده می‌شود.
-- `src/reasoner.js` با `createReasoner({ stream: true, onToken })` — وقتی `client.chatStream`
+- `src/core/reasoner.js` با `createReasoner({ stream: true, onToken })` — وقتی `client.chatStream`
   موجود باشد از آن استفاده می‌کند (وگرنه همان `chat()`)، خروجی را به همان `Action` نرمال می‌کند،
   و فقط chunk های محتوای پاسخ نهایی را به `onToken(text)` می‌دهد (fragment های آرگومان tool هرگز).
   `reasoner.setTokenSink(fn)` سینک را بعد از ساخت reasoner عوض می‌کند — REPL/UI نیازی به

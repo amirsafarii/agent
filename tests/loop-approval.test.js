@@ -20,11 +20,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AgentLoop, LoopState, TerminationReason, LoopEvents } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
-import { CheckpointManager } from '../src/checkpoint-manager.js';
-import { SessionLogger, attachSessionLogger } from '../src/session-logger.js';
+import { AgentLoop, LoopState, TerminationReason, LoopEvents } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
+import { CheckpointManager } from '../src/core/checkpoint-manager.js';
+import { SessionLogger, attachSessionLogger } from '../src/core/session-logger.js';
 
 function makeLoop({ script = [], loopOpts = {}, toolOpts = {}, tools } = {}) {
   const registry = tools || new ToolRegistry();

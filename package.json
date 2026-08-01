@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "ScrappyAi - auditable agent core: think -> act -> observe loop, tool registry, context window manager, checkpointing, tool approval, seven-layer memory, streaming.",
   "type": "module",
-  "main": "src/loop.js",
+  "main": "src/index.js",
   "scripts": {
     "test": "SCRAPPYAI_LOG=false node --test",
     "start": "node src/index.js"

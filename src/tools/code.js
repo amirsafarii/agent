@@ -17,7 +17,7 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { execa } from 'execa';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 import { splitCommand, truncate, cleanSpawnEnv } from './shell.js';
 
 const log = createLogger('tools:code');
@@ -57,7 +57,7 @@ const LANG_RUNNERS = {
  * @param {string} [opts.rootDir] sandbox root for path args
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.maxOutputChars]
- * @returns {Array<import('../tools.js').ToolDefinition>}
+ * @returns {Array<import('./registry.js').ToolDefinition>}
  */
 export function createCodeTools(opts = {}) {
   const {

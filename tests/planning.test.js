@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PlanningEngine, DAG, GoalDecomposer, TaskTree, DAGExecutor } from '../src/planning.js';
+import { PlanningEngine, DAG, GoalDecomposer, TaskTree, DAGExecutor } from '../src/planning/index.js';
 import { createPlanningTools } from '../src/tools/planning.js';
-import { ToolRegistry } from '../src/tools.js';
+import { ToolRegistry } from '../src/tools/index.js';
 
 test('DAG: cycle detection, topological sort, ready nodes', () => {
   const dag = new DAG();

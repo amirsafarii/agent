@@ -1,5 +1,5 @@
 import Redis from "ioredis";
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 
 const NULL_SENTINEL = "__$CACHE_NULL$__";
 const SNAPSHOT_TAG_PART = "invalidating";

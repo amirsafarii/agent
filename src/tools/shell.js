@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { mkdirSync } from 'node:fs';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools:shell');
 
@@ -39,7 +39,7 @@ const spawnedRegistry = new Map();
  * @param {string[]} [opts.deny] binaries that are always rejected, checked before `allow`
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.maxOutputChars]
- * @returns {import('../tools.js').ToolDefinition}
+ * @returns {import('./registry.js').ToolDefinition}
  */
 export function createShellTool(opts = {}) {
   const {
@@ -97,6 +97,10 @@ export function createShellTool(opts = {}) {
           timeout: runTimeout,
           shell: !!args.useShell,
           reject: false, // never throw on non-zero exit — report it instead
+          // Same spawn hygiene as the code/package tools: a nested
+          // `node --test` silently no-ops if it inherits NODE_TEST_CONTEXT.
+          env: cleanSpawnEnv(),
+          extendEnv: false,
         });
 
         const output = {
@@ -134,7 +138,7 @@ export function createShellTool(opts = {}) {
  * so the tool returns instantly with a pid and the agent keeps going; the
  * process is tracked so shell_kill can target it later.
  * @param {Object} [opts] same policy knobs as createShellTool
- * @returns {import('../tools.js').ToolDefinition}
+ * @returns {import('./registry.js').ToolDefinition}
  */
 export function createShellSpawnTool(opts = {}) {
   const {
@@ -164,7 +168,7 @@ export function createShellSpawnTool(opts = {}) {
       const runCwd = resolveRunCwd(args.cwd, cwd, sandboxRoot);
 
       log.info('shell_spawn:start', { command: commandLine, cwd: runCwd });
-      const child = spawn(bin, rest, { cwd: runCwd, detached: true, stdio: 'ignore' });
+      const child = spawn(bin, rest, { cwd: runCwd, detached: true, stdio: 'ignore', env: cleanSpawnEnv() });
       child.unref(); // let the agent process exit without waiting for the child
       spawnedRegistry.set(child.pid, { pid: child.pid, command: commandLine, startedAt: Date.now() });
       const output = { pid: child.pid, command: commandLine, cwd: runCwd, note: 'background process started; use shell_kill to stop it' };
@@ -178,7 +182,7 @@ export function createShellSpawnTool(opts = {}) {
  * Kill a process by pid. By default only pids that shell_spawn started in
  * this process are accepted (tracked) — killing arbitrary pids needs
  * force:true and is gated by the approval gate regardless.
- * @returns {import('../tools.js').ToolDefinition}
+ * @returns {import('./registry.js').ToolDefinition}
  */
 export function createShellKillTool() {
   return {
@@ -222,7 +226,7 @@ export function createShellKillTool() {
 
 /**
  * Resolve a binary name to its absolute path via $PATH (no subprocess).
- * @returns {import('../tools.js').ToolDefinition}
+ * @returns {import('./registry.js').ToolDefinition}
  */
 export function createShellWhichTool() {
   return {

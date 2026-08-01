@@ -36,7 +36,7 @@
  * Pure JavaScript (ES modules), uses global fetch (Node >= 18).
  */
 
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('clients:9router');
 

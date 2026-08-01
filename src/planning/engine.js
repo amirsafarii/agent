@@ -1,7 +1,10 @@
 /**
- * src/planning.js — Planning Engine for ScrappyAi
+ * planning/engine.js — Planning Engine for ScrappyAi
  * ------------------------------------------------
  * Manages structured multi-step plans and subtask tracking for agent runs.
+ * The lower-level execution model (DAG, goal decomposition, task trees) lives
+ * in sibling modules and is re-exported together with this engine from
+ * planning/index.js.
  *
  * Each task has:
  *   id: string (e.g. "1", "1.1", "task-1")
@@ -15,10 +18,12 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { createLogger } from './logger.js';
-import { DAG, GoalDecomposer, TaskTree, DAGExecutor } from './planning/index.js';
+import { createLogger } from '../core/logger.js';
 
-export { DAG, GoalDecomposer, TaskTree, DAGExecutor };
+export { DAG } from './dag.js';
+export { GoalDecomposer } from './goal-decomposer.js';
+export { TaskTree } from './task-tree.js';
+export { DAGExecutor } from './dag-executor.js';
 
 const log = createLogger('planning');
 

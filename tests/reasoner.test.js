@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createReasoner, createScriptedClient, ReasonerError } from '../src/reasoner.js';
+import { createReasoner, createScriptedClient, ReasonerError } from '../src/core/reasoner.js';
 
 test('normalizes a tool_call response and assigns a stable id', async () => {
   const client = {

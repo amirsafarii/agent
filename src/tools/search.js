@@ -11,7 +11,7 @@
  * Pure JavaScript (ES modules), uses global fetch (Node >= 18).
  */
 
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools:search');
 
@@ -28,7 +28,7 @@ const VALID_SAFESEARCH = [0, 1, 2];
  * @param {string} [opts.baseUrl] SearXNG instance base URL.
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.maxResults] cap on results returned to the reasoner (context hygiene).
- * @returns {import('../tools.js').ToolDefinition}
+ * @returns {import('./registry.js').ToolDefinition}
  */
 export function createWebSearchTool(opts = {}) {
   const {

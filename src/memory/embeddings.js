@@ -25,8 +25,14 @@ function hashEmbed(text) {
 }
 
 export class EmbeddingService {
-  /** @param {{ providerRegistry: import('../providers/provider-registry.js').ProviderRegistry }} deps */
-  constructor({ providerRegistry }) {
+  /**
+   * @param {Object} [deps]
+   * @param {{ getDefault: () => ({ name?: string, embed?: (text: string) => Promise<{ embeddings: number[][] }> } | undefined) }} [deps.providerRegistry]
+   *        Optional LLM provider registry (from the runtime that originally
+   *        hosted this memory system). Missing or unembeddable providers
+   *        transparently fall back to the deterministic offline embedding.
+   */
+  constructor({ providerRegistry } = {}) {
     this.providerRegistry = providerRegistry;
   }
 

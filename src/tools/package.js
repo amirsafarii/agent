@@ -20,7 +20,7 @@ import { promises as fs } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { execa } from 'execa';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 import { splitCommand, truncate, cleanSpawnEnv } from './shell.js';
 
 const log = createLogger('tools:package');
@@ -33,7 +33,7 @@ const DEFAULT_MAX_OUTPUT = 8_000;
  * @param {string} [opts.rootDir] sandbox root for cwd/path args
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.maxOutputChars]
- * @returns {Array<import('../tools.js').ToolDefinition>}
+ * @returns {Array<import('./registry.js').ToolDefinition>}
  */
 export function createPackageTools(opts = {}) {
   const {
