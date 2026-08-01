@@ -42,7 +42,7 @@ test('buildAgent: wires the full stack with default tools and memory', () => {
   assert.ok(agent.context instanceof ContextWindow);
   assert.ok(agent.tools instanceof ToolRegistry);
   const toolNames = agent.tools.list().map((t) => t.name).sort();
-  assert.deepEqual(toolNames, [
+  const expected = [
     'apply_patch',
     'code_run',
     'code_test',
@@ -69,23 +69,43 @@ test('buildAgent: wires the full stack with default tools and memory', () => {
     'shell_kill',
     'shell_spawn',
     'shell_which',
+    'spec_create',
+    'spec_file_done',
+    'spec_file_started',
+    'spec_file_verified',
+    'spec_next_files',
+    'spec_show',
+    'spec_status',
+    'spec_test_passed',
+    'todo_add',
+    'todo_create',
+    'todo_mark_tested',
+    'todo_mark_verified',
+    'todo_skip',
+    'todo_start',
+    'todo_status',
+    'todo_tick',
+    'todo_untick',
     'verify_command',
     'verify_file',
     'verify_json',
+    'verify_preflight',
     'verify_suite',
     'web_search',
     'write_file',
-  ]);
+  ];
+  assert.deepEqual(toolNames, expected);
   assert.equal(agent.tools.get('delete_file').requiresApproval, true, 'delete_file is approval-gated');
   assert.equal(agent.tools.get('shell_kill').requiresApproval, true, 'shell_kill is approval-gated');
   assert.equal(agent.sessionId, 'smoke-1');
   assert.equal(agent.memoryBackend, 'in-process', 'memory on by default, in-process without Redis');
   assert.ok(agent.systemPrompt.includes('ScrappyAi'), 'built-in system prompt resolved');
+  assert.match(agent.systemPrompt, /ANTI-LAZINESS/, 'anti-laziness (Rule Zero) is in the system prompt');
   assert.match(agent.systemPrompt, /Fallback Rule/, 'fallback rule is in the system prompt');
   assert.ok(agent.reasoner.getHistory, 'reasoner exposes history');
   assert.ok(agent.checkpoints, 'checkpoint manager attached');
-  assert.deepEqual(agent.adaptiveMaxSteps, { growthFactor: 2, max: 48 }, 'adaptive step budget on by default (12 base, 48 cap)');
-  assert.equal(agent.maxToolCallsPerTool, 8, 'tool-overuse guard on by default');
+  assert.ok(agent.strictFinal, 'strictFinal gate enabled by default');
+  assert.equal(agent.maxToolCallsPerTool, 12, 'tool-overuse guard defaults to 12');
 });
 
 test('buildAgent: runs one full turn end to end through the real 9router client', async () => {
@@ -174,6 +194,9 @@ test('createDefaultToolRegistry: registers into an existing registry too', () =>
   const registry = new ToolRegistry();
   const out = createDefaultToolRegistry({ registry });
   assert.equal(out, registry);
+  // When called without an explicit todoManager, the registry does NOT
+  // register the todo_*/spec_*/verify_preflight tools (they need a manager
+  // instance). 32 = the original core set.
   assert.equal(registry.list().length, 32);
   const names = registry.list().map((t) => t.name);
   for (const expected of ['edit_file', 'list_dir', 'search_files', 'make_dir', 'move_file', 'copy_file', 'delete_file',
