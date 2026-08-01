@@ -29,7 +29,12 @@ src/
 │   │                          + ApprovalManager (tool/plan/step/session grants)
 │   └── sandbox.js          ← realpath-based containment (blocks symlink escapes)
 ├── tools/
-│   ├── registry.js         ← lifecycle-aware ToolRegistry (DISCOVERED→…→ACTIVE→REMOVED)
+│   ├── registry.js         ← registration, discovery, plugin ownership, LLM definitions
+│   ├── runner.js           ← central validation/permission/middleware/timeout/execution
+│   ├── context.js          ← ToolContext boundary (logger/config/memory/signal)
+│   ├── schema.js/result.js/errors.js
+│   ├── middleware.js       ← reusable cross-cutting execution middleware
+│   ├── plugins/            ← static built-in plugin factories (no dynamic loading)
 │   ├── lifecycle.js        ← ToolLifecycle states + metadata + metrics
 │   └── {filesystem,shell,code,package,planning,verification,search}.js
 ├── planning/               ← engine.js (PlanningEngine) + task.js (Task/Run) +
@@ -65,6 +70,41 @@ tests/
 docs/
 └── LOOP.md                 ← full loop input/output schema (states, actions, results)
 ```
+
+## Modular Plugin-Based Tool System
+
+Tools are now independent from AgentLoop and the model Router. `ToolRegistry`
+only registers/discovers Tools, mounts static Plugins and produces
+`getDefinitions()` for the LLM. `ToolRunner` owns the shared
+validation → permission → middleware → timeout/abort → execute → normalize
+pipeline. `ToolContext` is the boundary exposed to a Tool; no Tool receives an
+AgentLoop reference.
+
+```js
+const hello = {
+  name: 'hello',
+  description: 'Say hello',
+  inputSchema: {
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name'],
+  },
+  async execute({ name }, context) {
+    context.logger.debug('hello');
+    return `Hello ${name}`;
+  },
+};
+
+const agent = buildAgent();
+agent.tools.register(hello);
+const result = await agent.tools.run('hello', { name: 'Ada' });
+```
+
+Plugins are ordinary containers (`{ name, metadata, tools }`) and are mounted
+with `agent.tools.use(plugin)`. Built-ins are mounted through the same API.
+See [`docs/TOOLS.md`](docs/TOOLS.md) and [`examples/custom-tool.js`](examples/custom-tool.js)
+for the complete contract, standard errors/results and middleware API.
+
 
 ## Evaluation, evidence, budget & artifacts
 
@@ -123,14 +163,14 @@ import {
 ```
 npm test
 ```
-(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **182 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools. Includes lifecycle, permissions, realpath sandbox, Task/Run, parallel executor, and end-to-end AbortSignal coverage.)
+(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **250 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools. Includes lifecycle, permissions, realpath sandbox, Task/Run, parallel executor, and end-to-end AbortSignal coverage.)
 
 ## Wiring it together
 
 `AgentLoop` needs three things injected:
 
 1. A `ContextWindow` instance — holds the running message trace (generic audit log).
-2. A `ToolRegistry` instance — register your tools with `register({ name, description, parameters, handler, timeoutMs })`.
+2. A `ToolRegistry` instance — register canonical Tools with `register({ name, description, inputSchema, execute, timeoutMs })` (the old `parameters`/`handler` form remains compatible).
 3. A `reasoner` function — `async (renderedContext, toolSchema) => action`, where `action` is one of:
    - `{ type: 'tool_call', tool, args, reasoning? }`
    - `{ type: 'final', content, reasoning? }`
@@ -363,7 +403,7 @@ The reasoner can also emit a parallel tool batch:
 
 ```
 agent.run → AgentLoop → reasoner → HTTP (9router)
-                     → ToolRegistry.execute → handler(args, { signal, context, logger, task, permissions, sandbox, tool })
+                     → ToolRegistry.run → ToolRunner pipeline → execute(input, ToolContext)
                                             → child_process (execa cancelSignal) / fetch
 ```
 

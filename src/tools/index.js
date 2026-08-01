@@ -1,15 +1,9 @@
 /**
- * tools/index.js — public entry for the tools module
- * -----------------------------------------------
- * One import site for the ToolRegistry and every built-in tool-suite
- * factory:
- *
- *   import { ToolRegistry, createFilesystemTools, createShellTool, ... } from 'src/tools/index.js';
- *
- * Implementation lives in focused sibling modules: registry.js (ToolRegistry),
- * lifecycle.js (tool lifecycle states + metadata), filesystem.js / shell.js /
- * code.js / package.js / planning.js / verification.js (tool suites),
- * search.js (web search).
+ * tools/index.js — public ToolSystem entry point
+ * ------------------------------------------------
+ * Registry/Runner/Context/Schema/Result/Error are the stable core. Built-in
+ * tools are exposed through static plugin factories; no dynamic loading or
+ * filesystem discovery is performed here.
  */
 export {
   ToolRegistry,
@@ -18,15 +12,43 @@ export {
   createToolMetadata,
   transitionLifecycle,
   promoteToActive,
-  canTransitionLifecycle,
   EXECUTABLE_LIFECYCLES,
-  SCHEMA_LIFECYCLES,
 } from './registry.js';
+export { ToolSystem } from './system.js';
+export { ToolRunner } from './runner.js';
+export { ToolContext, createToolContext } from './context.js';
+export {
+  ToolSchema,
+  normalizeInputSchema,
+  legacyParametersFromSchema,
+  validateInput,
+} from './schema.js';
+export {
+  ToolResult,
+  normalizeToolResult,
+  toLegacyResult,
+  resultErrorMessage,
+} from './result.js';
+export { ToolErrorCode, ToolErrorCodes, toolError } from './errors.js';
+export {
+  Middleware,
+  createMiddleware,
+  normalizeMiddleware,
+  composeMiddleware,
+  validationMiddleware,
+  permissionMiddleware,
+  timeoutMiddleware,
+  createLoggingMiddleware,
+} from './middleware.js';
+
+// Backward-compatible lifecycle aliases.
 export {
   ToolLifecycle as Lifecycle,
   createToolMetadata as toolMetadata,
   promoteToActive as promoteTool,
 } from './lifecycle.js';
+
+// Static built-in tool factories.
 export { createFilesystemTools } from './filesystem.js';
 export { createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool } from './shell.js';
 export { createCodeTools } from './code.js';
@@ -37,5 +59,22 @@ export { createSpecTools } from './spec.js';
 export { createVerificationTools } from './verification.js';
 export { createWebSearchTool } from './search.js';
 export { createHttpTools } from './http.js';
+
+// Static plugin API. Dynamic/npm/filesystem discovery is intentionally absent.
+export {
+  createPlugin,
+  createFilesystemPlugin,
+  createFilePlugin,
+  createWebPlugin,
+  createHttpPlugin,
+  createShellPlugin,
+  createCodePlugin,
+  createPackagePlugin,
+  createPlanningPlugin,
+  createTodoPlugin,
+  createSpecPlugin,
+  createVerificationPlugin,
+  createDefaultPlugins,
+} from './plugins/index.js';
 
 export { ToolRegistry as default } from './registry.js';

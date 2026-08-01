@@ -198,12 +198,38 @@ export const DEFAULT_TOOL_RISK = Object.freeze({
  * @returns {Object}
  */
 export function normalizePermissions(perms = {}) {
+  // The plugin-facing API also accepts a compact capability list:
+  //   permissions: ['network', 'process']
+  // and boolean flags:
+  //   permissions: { network: true, filesystem: false }
+  // Keep the internal profile representation (axis -> ranked value) stable.
+  if (Array.isArray(perms)) {
+    const out = {
+      filesystem: PermissionValue.NONE,
+      network: PermissionValue.NONE,
+      shell: PermissionValue.NONE,
+      process: PermissionValue.NONE,
+      package: PermissionValue.NONE,
+    };
+    for (const axis of perms) {
+      if (Object.prototype.hasOwnProperty.call(out, axis)) out[axis] = PermissionValue.ALLOW;
+    }
+    return out;
+  }
+
+  const source = perms && typeof perms === 'object' ? perms : {};
+  const value = (axis) => {
+    const raw = source[axis];
+    if (raw === true) return PermissionValue.ALLOW;
+    if (raw === false || raw == null) return PermissionValue.NONE;
+    return raw;
+  };
   return {
-    filesystem: perms.filesystem || PermissionValue.NONE,
-    network: perms.network || PermissionValue.NONE,
-    shell: perms.shell || PermissionValue.NONE,
-    process: perms.process || PermissionValue.NONE,
-    package: perms.package || PermissionValue.NONE,
+    filesystem: value('filesystem'),
+    network: value('network'),
+    shell: value('shell'),
+    process: value('process'),
+    package: value('package'),
   };
 }
 
