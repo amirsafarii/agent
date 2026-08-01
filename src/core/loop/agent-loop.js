@@ -38,6 +38,9 @@ import { DEFAULT_COMPRESS_MAX_CHARS, defaultCompressToolResult, normalizeArgs, s
 import { Run } from '../../planning/task.js';
 import { parallel as parallelExec } from '../../planning/parallel-executor.js';
 import { ApprovalManager } from '../../security/permissions.js';
+import { getRetryPolicyForTool, RetryPolicy } from './retry-policy.js';
+import { EventBus } from '../event-bus.js';
+import { globalTracer } from '../tracer.js';
 
 const log = createLogger('loop');
 
@@ -120,6 +123,7 @@ export class AgentLoop {
     maxRepeatedToolCalls = 3,
     maxTaskTimeoutMs = DEFAULT_MAX_TASK_TIMEOUT_MS,
     toolRetry = {},
+    toolRetryPolicies = {},
     maxConsecutiveToolExhaustion = DEFAULT_MAX_CONSECUTIVE_TOOL_EXHAUSTION,
     maxToolCallsPerTool = DEFAULT_MAX_TOOL_CALLS_PER_TOOL,
     adaptiveMaxSteps = false,
@@ -140,6 +144,7 @@ export class AgentLoop {
     budgetManager,
     goalState,
     artifactManager,
+    eventBus,
   } = {}) {
     if (!context) throw new LoopError('AgentLoop requires a ContextWindow instance ("context").');
     if (!tools) throw new LoopError('AgentLoop requires a ToolRegistry instance ("tools").');
@@ -152,6 +157,7 @@ export class AgentLoop {
     this.maxRepeatedToolCalls = maxRepeatedToolCalls;
     this.maxTaskTimeoutMs = maxTaskTimeoutMs;
     this.toolRetry = { ...DEFAULT_TOOL_RETRY, ...toolRetry };
+    this.toolRetryPolicies = toolRetryPolicies;
     this.maxConsecutiveToolExhaustion = maxConsecutiveToolExhaustion;
     this.maxToolCallsPerTool = maxToolCallsPerTool;
     this.adaptiveMaxSteps = adaptiveMaxSteps && typeof adaptiveMaxSteps === 'object'
@@ -176,6 +182,7 @@ export class AgentLoop {
     this.budgetManager = budgetManager || null;
     this.goalState = goalState || null;
     this.artifactManager = artifactManager || null;
+    this.eventBus = eventBus || new EventBus();
     /** @type {Run|null} current Run (separate from Task) */
     this.currentRun = null;
 
@@ -579,6 +586,8 @@ export class AgentLoop {
    * task-timeout clock instead of restarting them).
    */
   async _execute({ userInput, runOpts = {}, resumeFrom = null }) {
+    const runSpan = globalTracer.startSpan('agent.run');
+    this.currentRunSpan = runSpan;
     const { signal } = runOpts;
     const isResume = !!resumeFrom;
     const startedAt = Date.now() - (isResume ? resumeFrom.elapsedMs : 0);
@@ -652,6 +661,16 @@ export class AgentLoop {
       maxTokens: this.context.maxTokens,
     });
 
+    this.eventBus.publish('agent.run.started', {
+      userInput,
+      runId: this.currentRun?.id,
+      startStep,
+      maxSteps: this.maxSteps,
+      budget,
+      usedTokens: this.context.usedTokens,
+      maxTokens: this.context.maxTokens,
+    });
+
     for (let step = startStep; step <= budget; step += 1) {
       this._currentStep = step;
       const elapsedMs = Date.now() - startedAt;
@@ -680,6 +699,7 @@ export class AgentLoop {
 
       this._emit(LoopEvents.STEP_START, { step, elapsedMs });
       log.debug('step:start', { step, maxSteps: this.maxSteps, elapsedMs });
+      this.eventBus.publish('agent.step.started', { step, elapsedMs });
 
       let action;
       if (pendingAction) {
@@ -690,6 +710,7 @@ export class AgentLoop {
       } else {
         // --- THINK -------------------------------------------------------
         this._safeTransition(LoopState.THINKING);
+        const reasonerSpan = globalTracer.startSpan('reasoner');
         try {
           const rendered = this.context.render();
           const toolSchema = this.tools.toSchema();
@@ -698,7 +719,9 @@ export class AgentLoop {
           this._validateAction(action);
           // Budget ledger: one LLM (reasoner) call consumed.
           this.budgetManager?.recordModelCall();
+          reasonerSpan.setStatus('ok');
         } catch (err) {
+          reasonerSpan.setStatus('error', err.message);
           this._emit(LoopEvents.ERROR, { step, phase: 'think', error: serializeError(err) });
           log.error('step:think_failed', { step, error: serializeError(err) });
           await this.context.append({ role: 'system', content: `[loop error during think] ${err.message}` });
@@ -711,6 +734,8 @@ export class AgentLoop {
             startedAt,
             extra: { error: err.message },
           });
+        } finally {
+          globalTracer.endSpan(reasonerSpan);
         }
         this._emit(LoopEvents.THINK, { step, action });
         log.info('step:think', { step, actionType: action.type, tool: action.tool, args: action.args });
@@ -853,7 +878,11 @@ export class AgentLoop {
         log.info('step:act', { step, tool: action.tool, args: action.args });
       }
 
-      const retryPolicy = { ...this.toolRetry, ...(action.retry || {}) };
+      const retryPolicy = getRetryPolicyForTool(
+        isParallel ? (action.tools[0]?.tool || '') : action.tool,
+        this.toolRetryPolicies,
+        action.retry || this.toolRetry
+      );
       const actStartedAt = Date.now();
       let result;
       let attempts;
@@ -988,25 +1017,57 @@ export class AgentLoop {
       // Ambient run identity so tools can attribute artifacts.
       run: this.currentRun,
     };
-    while (true) {
-      attempt += 1;
-      if (signal && signal.aborted) {
-        return {
-          result: { ok: false, error: 'aborted', code: 'ABORTED', durationMs: 0 },
-          attempts: attempt,
-        };
+    this.eventBus.publish('agent.tool.started', { tool: action.tool, args: action.args, step });
+
+    let spanName = `tool.${action.tool}`;
+    if (action.tool === 'web_search') {
+      spanName = 'tool.search';
+    } else if (action.tool === 'code_run') {
+      spanName = 'tool.code_run';
+    } else if (action.tool?.startsWith('verify_')) {
+      spanName = 'verification';
+    }
+    const toolSpan = globalTracer.startSpan(spanName);
+    toolSpan.setAttribute('tool', action.tool);
+    toolSpan.setAttribute('step', step);
+
+    try {
+      while (true) {
+        attempt += 1;
+        if (signal && signal.aborted) {
+          const result = { ok: false, error: 'aborted', code: 'ABORTED', durationMs: 0 };
+          this.eventBus.publish('agent.tool.completed', { tool: action.tool, args: action.args, result, step });
+          toolSpan.setStatus('error', 'aborted');
+          return {
+            result,
+            attempts: attempt,
+          };
+        }
+        lastResult = await this.tools.execute(action.tool, action.args, runCtx);
+        if (lastResult.ok) {
+          this.eventBus.publish('agent.tool.completed', { tool: action.tool, args: action.args, result: lastResult, step });
+          toolSpan.setStatus('ok');
+          return { result: lastResult, attempts: attempt };
+        }
+
+        const attemptsLeft = typeof policy.shouldRetry === 'function'
+          ? policy.shouldRetry(attempt, lastResult.code)
+          : (attempt <= policy.retries && (policy.retryableCodes || []).includes(lastResult.code));
+        if (!attemptsLeft) {
+          this.eventBus.publish('agent.tool.completed', { tool: action.tool, args: action.args, result: lastResult, step });
+          toolSpan.setStatus('error', lastResult.error || lastResult.code);
+          return { result: lastResult, attempts: attempt };
+        }
+
+        const backoffMs = typeof policy.getDelay === 'function'
+          ? policy.getDelay(attempt)
+          : policy.backoffMs * Math.pow(policy.factor, attempt - 1);
+        this._emit(LoopEvents.TOOL_RETRY, { step, tool: action.tool, attempt, backoffMs, error: lastResult.error, code: lastResult.code });
+        log.warn('step:tool_retry', { step, tool: action.tool, attempt, backoffMs, code: lastResult.code, error: lastResult.error });
+        if (backoffMs > 0) await sleep(backoffMs);
       }
-      lastResult = await this.tools.execute(action.tool, action.args, runCtx);
-      if (lastResult.ok) return { result: lastResult, attempts: attempt };
-
-      const isRetryable = (policy.retryableCodes || []).includes(lastResult.code);
-      const attemptsLeft = attempt <= policy.retries && isRetryable;
-      if (!attemptsLeft) return { result: lastResult, attempts: attempt };
-
-      const backoffMs = policy.backoffMs * Math.pow(policy.factor, attempt - 1);
-      this._emit(LoopEvents.TOOL_RETRY, { step, tool: action.tool, attempt, backoffMs, error: lastResult.error, code: lastResult.code });
-      log.warn('step:tool_retry', { step, tool: action.tool, attempt, backoffMs, code: lastResult.code, error: lastResult.error });
-      if (backoffMs > 0) await sleep(backoffMs);
+    } finally {
+      globalTracer.endSpan(toolSpan);
     }
   }
 
@@ -1098,6 +1159,19 @@ export class AgentLoop {
    */
   _terminate({ status, reason, step, startedAt, extra = {} }) {
     const elapsedMs = Date.now() - startedAt;
+
+    if (this.currentRunSpan) {
+      this.currentRunSpan.setAttribute('status', status);
+      this.currentRunSpan.setAttribute('reason', reason);
+      this.currentRunSpan.setAttribute('steps', step);
+      globalTracer.endSpan(this.currentRunSpan);
+      this.currentRunSpan = null;
+    }
+
+    this.eventBus.publish('agent.run.completed', { status, reason, steps: step, elapsedMs });
+    if (status === 'final') {
+      this.eventBus.publish('agent.task.completed', { status, reason, steps: step, elapsedMs });
+    }
 
     // Close out the Run (separate from any Tasks it owns).
     if (this.currentRun) {
