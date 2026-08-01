@@ -384,24 +384,54 @@ function toOpenAiMessages(systemPrompt, messages) {
 }
 
 function toOpenAiTool(toolDef) {
-  const properties = {};
-  const required = [];
-  for (const [key, spec] of Object.entries(toolDef.parameters || {})) {
-    properties[key] = {
-      type: spec.type === 'array' ? 'array' : spec.type === 'object' ? 'object' : spec.type || 'string',
-    };
-    if (spec.description) properties[key].description = spec.description;
-    if (Array.isArray(spec.enum)) properties[key].enum = spec.enum;
-    if (spec.required) required.push(key);
-  }
+  // New ToolRegistry definitions expose canonical JSON Schema through
+  // `inputSchema`. Keep accepting the historical parameter-map shape because
+  // third-party clients may still pass it directly to this adapter.
+  const schema = toolDef.inputSchema || toolDef.parameters || {};
+  const parameters = isJsonSchemaObject(schema)
+    ? cloneSchema(schema)
+    : legacyParametersToJsonSchema(schema);
+  if (!parameters.type) parameters.type = 'object';
+  if (!parameters.properties) parameters.properties = {};
+  if (!Array.isArray(parameters.required)) parameters.required = [];
+
   return {
     type: 'function',
     function: {
       name: toolDef.name,
       description: toolDef.description || '',
-      parameters: { type: 'object', properties, required },
+      parameters,
     },
   };
+}
+
+function isJsonSchemaObject(schema) {
+  return !!(
+    schema &&
+    typeof schema === 'object' &&
+    !Array.isArray(schema) &&
+    (schema.type === 'object' || schema.properties || Array.isArray(schema.required))
+  );
+}
+
+function legacyParametersToJsonSchema(parameters) {
+  const properties = {};
+  const required = [];
+  for (const [key, rawSpec] of Object.entries(parameters || {})) {
+    const spec = rawSpec && typeof rawSpec === 'object' ? { ...rawSpec } : {};
+    const { required: isRequired, ...property } = spec;
+    properties[key] = property;
+    if (isRequired) required.push(key);
+  }
+  return { type: 'object', properties, required };
+}
+
+function cloneSchema(value) {
+  if (Array.isArray(value)) return value.map(cloneSchema);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) out[key] = cloneSchema(child);
+  return out;
 }
 
 /** Map an OpenAI-shaped chat.completions response to reasoner.js's RawResponse. */

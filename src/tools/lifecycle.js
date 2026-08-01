@@ -82,6 +82,10 @@ export const SCHEMA_LIFECYCLES = Object.freeze([
 export function createToolMetadata(meta = {}) {
   const now = new Date().toISOString();
   return {
+    // Preserve unknown metadata keys. This is what lets a plugin add its own
+    // metadata (trace names, documentation links, feature flags, etc.) without
+    // making the Tool contract or old tools change.
+    ...meta,
     version: meta.version || '1.0.0',
     author: meta.author || 'builtin',
     tags: Array.isArray(meta.tags) ? meta.tags.slice() : [],

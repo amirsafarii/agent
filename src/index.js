@@ -1,8 +1,8 @@
 /**
  * index.js — wire everything together
  * -----------------------------------------------
- * Builds a ready-to-run ScrappyAi agent: ContextWindow + ToolRegistry
- * (shell, read_file, write_file, web_search) + a reasoner backed by the
+ * Builds a ready-to-run ScrappyAi agent: ContextWindow + the static
+ * plugin-based ToolRegistry/ToolRunner system + a reasoner backed by the
  * 9router client, all driven by AgentLoop.
  *
  * Usage:
@@ -27,18 +27,8 @@ import { buildSystemPrompt } from './core/system-prompt.js';
 import { createNineRouterClient } from './clients/9router.js';
 import {
   ToolRegistry,
-  createFilesystemTools,
-  createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool,
-  createCodeTools,
-  createPackageTools,
-  createPlanningTools,
-  createTodoTools,
-  createSpecTools,
-  createVerificationTools,
-  createWebSearchTool,
-  createHttpTools,
+  createDefaultPlugins,
 } from './tools/index.js';
-import { createPreflightTool } from './tools/todo.js';
 import { PlanningEngine } from './planning/index.js';
 import { Spec } from './planning/spec.js';
 import { VerificationEngine } from './verification/index.js';
@@ -136,6 +126,8 @@ export function loadSystemPrompt(override) {
  *   (readonly | developer | autonomous | admin)
  * @param {import('./security/sandbox.js').Sandbox} [opts.sandbox]
  * @param {import('./security/permissions.js').ApprovalManager} [opts.approvals]
+ * @param {Array<Object>} [opts.plugins] additional static plugins to mount
+ * @param {boolean} [opts.includeDefaultPlugins=true]
  * @returns {import('./tools/registry.js').ToolRegistry}
  */
 export function createDefaultToolRegistry(opts = {}) {
@@ -153,72 +145,44 @@ export function createDefaultToolRegistry(opts = {}) {
     sandbox,
     filesRoot,
     approvals,
+    config: opts.config,
+    memory: opts.memory,
   });
-  // If caller passed a pre-built registry, still align profile/sandbox.
+  // If caller passed a pre-built registry, still align its host capabilities.
   if (opts.registry) {
     registry.setProfile?.(profile);
     registry.sandbox = sandbox;
     registry.approvals = approvals;
+    if (opts.config) registry.config = opts.config;
+    if (opts.memory !== undefined) registry.memory = opts.memory;
   }
 
-  const shellOpts = { cwd: opts.shellCwd || filesRoot, sandboxRoot: filesRoot };
-
-  // filesystem suite (9 tools, incl. read_file/write_file) — realpath sandbox
-  for (const def of createFilesystemTools({ rootDir: filesRoot, sandbox })) registry.register(def);
-
-  // shell suite (4 tools)
-  registry.register(createShellTool(shellOpts));
-  registry.register(createShellSpawnTool(shellOpts));
-  registry.register(createShellKillTool());
-  registry.register(createShellWhichTool());
-
-  // code suite (3 tools)
-  for (const def of createCodeTools({ rootDir: filesRoot })) registry.register(def);
-
-  // package suite (3 tools) — lifecycle scripts gated by sandbox level
-  for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
-
-  // planning suite (4 tools — legacy plan_* tools)
-  for (const def of createPlanningTools({ engine: opts.planningEngine })) registry.register(def);
-
-  // TODO checklist tools (9 tools) — only registered when a TodoManager is
-  // provided (buildAgent always passes one). Standalone uses of
-  // createDefaultToolRegistry({ registry }) without a manager keep the
-  // original minimal tool surface.
-  if (opts.todoManager) {
-    for (const def of createTodoTools({ manager: opts.todoManager, rootDir: filesRoot })) registry.register(def);
-  }
-
-  // Spec / PRD tools (Planner-Executor pattern) — same opt-in policy.
-  if (opts.spec) {
-    for (const def of createSpecTools({ spec: opts.spec, rootDir: filesRoot })) registry.register(def);
-  }
-
-  // verification suite (4 tools)
-  for (const def of createVerificationTools({ rootDir: filesRoot, engine: opts.verificationEngine })) registry.register(def);
-
-  // verify_preflight — automatic pre-final sweep (TODO + Spec + extra checks).
-  // Registered if a todoManager was provided (it is, by default, via buildAgent).
-  if (opts.todoManager) {
-    registry.register(createPreflightTool({
-      todoManager: opts.todoManager,
-      spec: opts.spec,
-      verificationEngine: opts.verificationEngine,
-      rootDir: filesRoot,
-    }));
-  }
-
-  registry.register(createWebSearchTool());
-
-  // HTTP / network suite (http_get, http_post, http_request) — bounded by
-  // timeout, max response size, and an allowed-domains allowlist when given.
-  for (const def of createHttpTools({
+  const httpOpts = {
     timeoutMs: opts.httpTimeoutMs ?? (Number(process.env.SCRAPPYAI_HTTP_TIMEOUT_MS) || undefined),
     maxResponseSize: opts.httpMaxResponseSize ?? (Number(process.env.SCRAPPYAI_HTTP_MAX_RESPONSE_SIZE) || undefined),
     allowedDomains: opts.httpAllowedDomains ?? (process.env.SCRAPPYAI_HTTP_ALLOWED_DOMAINS
       ? process.env.SCRAPPYAI_HTTP_ALLOWED_DOMAINS.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined),
-  })) registry.register(def);
+  };
+
+  const defaultPlugins = opts.includeDefaultPlugins === false
+    ? []
+    : createDefaultPlugins({
+        filesRoot,
+        sandbox,
+        shellOpts: { cwd: opts.shellCwd || filesRoot, sandboxRoot: filesRoot },
+        planningEngine: opts.planningEngine,
+        todoManager: opts.todoManager,
+        spec: opts.spec,
+        verificationEngine: opts.verificationEngine,
+        httpOpts,
+      });
+
+  // Static composition only: no dynamic plugin loading or filesystem
+  // discovery. Every built-in and custom plugin goes through registry.use().
+  for (const plugin of [...defaultPlugins, ...(Array.isArray(opts.plugins) ? opts.plugins : [])]) {
+    registry.use(plugin);
+  }
 
   return registry;
 }
@@ -263,6 +227,9 @@ export function buildAgent(opts = {}) {
     verificationEngine,
     todoManager,
     spec,
+    plugins: opts.plugins,
+    includeDefaultPlugins: opts.includeDefaultPlugins,
+    config: opts.config,
   });
   const context =
     opts.context ||
@@ -270,6 +237,10 @@ export function buildAgent(opts = {}) {
       maxTokens: readEnvInt('SCRAPPYAI_MAX_TOKENS', 16000),
       systemPrompt,
     });
+  // Direct `agent.tools.run()` calls receive the same stable context boundary;
+  // AgentLoop calls also pass it explicitly per execution.
+  tools.context = context;
+  if (opts.config) tools.config = opts.config;
 
   const client = createNineRouterClient();
   const reasoner = createReasoner({
@@ -348,6 +319,7 @@ export function buildAgent(opts = {}) {
   if (opts.memory !== false) {
     const memory = createMemory({ client });
     if (memory) {
+      tools.memory = memory.memoryManager;
       wireMemory(agent, {
         memoryManager: memory.memoryManager,
         extractor: memory.extractor,
@@ -450,14 +422,8 @@ if (isMain) {
   main();
 }
 
-export {
-  createPlanningTools,
-  createTodoTools,
-  createSpecTools,
-  createVerificationTools,
-  PlanningEngine,
-  VerificationEngine,
-};
+export { createPlanningTools, createTodoTools, createSpecTools, createVerificationTools } from './tools/index.js';
+export { PlanningEngine, VerificationEngine };
 export { TodoManager } from './core/todo-manager.js';
 export { Spec } from './planning/spec.js';
 export { checkCompleteness, formatCompletenessResult } from './verification/completeness.js';
@@ -485,7 +451,36 @@ export {
 export {
   ToolLifecycle,
   ToolRegistry,
+  ToolSystem,
+  ToolRunner,
+  ToolContext,
+  ToolSchema,
+  ToolResult,
   ToolError,
+  ToolErrorCode,
+  ToolErrorCodes,
+  normalizeInputSchema,
+  validateInput,
+  createToolContext,
+  createPlugin,
+  createFilesystemPlugin,
+  createFilePlugin,
+  createWebPlugin,
+  createHttpPlugin,
+  createShellPlugin,
+  createCodePlugin,
+  createPackagePlugin,
+  createPlanningPlugin,
+  createTodoPlugin,
+  createSpecPlugin,
+  createVerificationPlugin,
+  createDefaultPlugins,
+  Middleware,
+  createMiddleware,
+  validationMiddleware,
+  permissionMiddleware,
+  timeoutMiddleware,
+  createLoggingMiddleware,
 } from './tools/index.js';
 export { createHttpTools } from './tools/index.js';
 

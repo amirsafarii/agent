@@ -154,6 +154,7 @@ export function createHttpTools(opts = {}) {
       name: 'http_get',
       description: `GET a URL. Auto-parses JSON when the response is application/json. Bounded by timeout, max response size, allowed domains, and a redirect limit.`,
       version: '1.0.0',
+      permissions: { network: 'allow' },
       parameters: {
         url: { type: 'string', description: 'Full URL to GET.', required: true },
         json: { type: 'string', enum: ['auto', 'parse', 'raw'], description: 'Response parsing: auto (parse when content-type is JSON), parse (force JSON.parse), raw (return text). Default auto.' },
@@ -170,6 +171,7 @@ export function createHttpTools(opts = {}) {
       name: 'http_post',
       description: `POST a URL with a body. Auto-parse: sends JSON when bodyJson=true, otherwise sends body as text.`,
       version: '1.0.0',
+      permissions: { network: 'allow' },
       parameters: {
         url: { type: 'string', description: 'Full URL to POST to.', required: true },
         body: { type: 'string', description: 'Request body (string).' },
@@ -195,6 +197,7 @@ export function createHttpTools(opts = {}) {
       name: 'http_request',
       description: `Send an arbitrary HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD) with full control over method, headers, body, and response parsing.`,
       version: '1.0.0',
+      permissions: { network: 'allow' },
       parameters: {
         url: { type: 'string', description: 'Full URL.', required: true },
         method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'], description: 'HTTP method. Default GET.' },

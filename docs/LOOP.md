@@ -18,7 +18,7 @@ run(userInput)
   │    │    3. context.usedTokens > maxTokens (بعد از compaction)? → status:'error', reason: MAX_TOKENS
   │    │    4. هر stopCondition سفارشی؟        → status:'stopped',  reason: <custom string>
   │    │
-  │    ├─ THINK   : action = await reasoner(context.render(), tools.toSchema())
+  │    ├─ THINK   : action = await reasoner(context.render(), tools.getDefinitions())
   │    │            validate(action) طبق Action Schema ثابت (بخش ۳)
   │    │
   │    ├─ اگر action.type === 'final'              → status:'final',             reason: FINAL_ANSWER   (پایان)
@@ -202,7 +202,7 @@ reasoner باید بلافاصله به ابزار دیگری (مثلاً `web_s
 
 ## 5. Tool Result Schema (استاندارد) — از `tools/registry.js`
 
-هر `ToolRegistry.execute()` دقیقاً این شکل را برمی‌گرداند (هیچ‌وقت throw نمی‌کند):
+هر `ToolRegistry.run()` دقیقاً این شکل استاندارد را برمی‌گرداند (هیچ‌وقت throw نمی‌کند؛ `execute()` فقط adapter سازگاری قدیمی است):
 
 ```ts
 type ToolResult =

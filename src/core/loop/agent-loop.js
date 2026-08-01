@@ -41,6 +41,7 @@ import { ApprovalManager } from '../../security/permissions.js';
 import { getRetryPolicyForTool, RetryPolicy } from './retry-policy.js';
 import { EventBus } from '../event-bus.js';
 import { globalTracer } from '../tracer.js';
+import { toLegacyResult } from '../../tools/result.js';
 
 const log = createLogger('loop');
 
@@ -746,7 +747,11 @@ export class AgentLoop {
         const reasonerSpan = globalTracer.startSpan('reasoner');
         try {
           const rendered = this.context.render();
-          const toolSchema = this.tools.toSchema();
+          // Registry exposes only provider-safe definitions. The loop never
+          // sees a Tool implementation or executes it directly.
+          const toolSchema = typeof this.tools.getDefinitions === 'function'
+            ? this.tools.getDefinitions()
+            : this.tools.toSchema();
           // End-to-end cancellation: signal reaches the reasoner → HTTP client.
           action = await this.reasoner(rendered, toolSchema, { signal });
           this._validateAction(action);
@@ -1073,9 +1078,9 @@ export class AgentLoop {
    * (e.g. VALIDATION_ERROR, UNKNOWN_TOOL) fails fast on attempt 1 since a
    * retry can't fix a malformed call.
    *
-   * Handler context is fully populated so cancellation + task + permissions
+   * ToolRunner context is fully populated so cancellation + task + permissions
    * propagate end-to-end:
-   *   handler(args, { signal, context, logger, task, permissions, sandbox, tool })
+   *   execute(input, { signal, context, logger, task, permissions, sandbox, tool })
    *
    * @returns {Promise<{result: ToolResult, attempts: number}>} attempts = number of tries actually made (>=1)
    */
@@ -1091,14 +1096,12 @@ export class AgentLoop {
     };
     this.eventBus.publish('agent.tool.started', { tool: action.tool, args: action.args, step });
 
-    let spanName = `tool.${action.tool}`;
-    if (action.tool === 'web_search') {
-      spanName = 'tool.search';
-    } else if (action.tool === 'code_run') {
-      spanName = 'tool.code_run';
-    } else if (action.tool?.startsWith('verify_')) {
-      spanName = 'verification';
-    }
+    // Observability is metadata-driven. AgentLoop does not know built-in or
+    // custom Tool names; a plugin may provide `metadata.traceName`, otherwise
+    // the generic category is used.
+    const registeredTool = this.tools.get?.(action.tool);
+    const spanName = registeredTool?.metadata?.traceName
+      || `tool.${registeredTool?.metadata?.category || 'custom'}`;
     const toolSpan = globalTracer.startSpan(spanName);
     toolSpan.setAttribute('tool', action.tool);
     toolSpan.setAttribute('step', step);
@@ -1115,7 +1118,15 @@ export class AgentLoop {
             attempts: attempt,
           };
         }
-        lastResult = await this.tools.execute(action.tool, action.args, runCtx);
+        // ToolRunner is the execution boundary. AgentLoop only asks the
+        // registry/runner facade to run a named tool; it never calls a Tool's
+        // implementation or the legacy execute() adapter.
+        const runTool = typeof this.tools.run === 'function'
+          ? this.tools.run.bind(this.tools)
+          : this.tools.runner?.run?.bind(this.tools.runner);
+        if (!runTool) throw new LoopError('Agent tools must expose ToolRunner.run().', 'TOOL_RUNNER_MISSING');
+        const rawResult = await runTool(action.tool, action.args, runCtx);
+        lastResult = toLegacyResult(rawResult);
         if (lastResult.ok) {
           this.eventBus.publish('agent.tool.completed', { tool: action.tool, args: action.args, result: lastResult, step });
           toolSpan.setStatus('ok');

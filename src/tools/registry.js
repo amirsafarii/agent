@@ -1,18 +1,14 @@
 /**
- * tools/registry.js — Tool Registry
- * -----------------------------------------------
- * Register tools with a JSON-schema-ish contract, execute them with real
- * argument validation, a per-tool timeout, permission checks, lifecycle
- * gating, and error handling that never throws out of the loop — every call
- * resolves to a plain result object so the reasoner can decide whether to
- * retry, pick another tool, or give up.
+ * tools/registry.js — ToolRegistry
+ * ---------------------------------
+ * Registry is responsible for registration, plugin ownership, discovery and
+ * definitions. It deliberately does not execute business logic. Execution is
+ * delegated to ToolRunner, which owns validation, permissions, middleware,
+ * timeout/abort and result normalization.
  *
- * Lifecycle (see tools/lifecycle.js):
- *   DISCOVERED → DRAFT → VALIDATING → TESTING → APPROVED
- *     → REGISTERED → ACTIVE → DEPRECATED → REMOVED
- *
- * Handler context (end-to-end cancellation + structured services):
- *   handler(args, { signal, context, logger, task, permissions, sandbox, tool })
+ * `execute()` remains as a compatibility adapter for older ScrappyAi callers.
+ * New code should use `run()` and receive the standard `{ error: { code,
+ * message } }` result shape.
  *
  * Pure JavaScript (ES modules). No TypeScript, no build step.
  */
@@ -23,11 +19,13 @@ import {
   createToolMetadata,
   transitionLifecycle,
   promoteToActive,
-  recordExecutionMetrics,
   EXECUTABLE_LIFECYCLES,
   SCHEMA_LIFECYCLES,
-  canTransitionLifecycle,
 } from './lifecycle.js';
+import { ToolRunner } from './runner.js';
+import { ToolError } from './errors.js';
+import { normalizeInputSchema, legacyParametersFromSchema, validateInput } from './schema.js';
+import { toLegacyResult } from './result.js';
 import {
   resolveToolPermissions,
   resolveToolRisk,
@@ -40,50 +38,44 @@ import {
 import { createSandbox, levelFromPermissions } from '../security/sandbox.js';
 
 const log = createLogger('tools');
-
-export class ToolError extends Error {
-  constructor(message, code = 'TOOL_ERROR') {
-    super(message);
-    this.name = 'ToolError';
-    this.code = code;
-  }
-}
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 /**
- * @typedef {Object} ToolParamSchema
- * @property {string} type - 'string' | 'number' | 'boolean' | 'object' | 'array'
- * @property {boolean} [required]
- * @property {any[]} [enum]
- * @property {string} [description]
- *
  * @typedef {Object} ToolDefinition
  * @property {string} name
  * @property {string} description
- * @property {Object<string, ToolParamSchema>} [parameters]
- * @property {Function} handler - async (args, ctx) => any
+ * @property {Object} [inputSchema] JSON Schema object for the input
+ * @property {Object<string,Object>} [parameters] legacy parameter-map alias
+ * @property {Function} execute async (input, context) => any
+ * @property {Function} handler legacy alias for execute
  * @property {number} [timeoutMs=15000]
+ * @property {boolean} [enabled=true]
  * @property {boolean} [requiresApproval=false]
- * @property {Object} [permissions]
+ * @property {Object|string[]} [permissions]
  * @property {string} [risk]
- * @property {Object} [metadata]
- * @property {string} [lifecycle] initial lifecycle (default: promoted to ACTIVE)
- * @property {boolean} [autoActivate=true] walk lifecycle to ACTIVE on register
+ * @property {Object} [metadata] arbitrary stable metadata
  */
-
-const DEFAULT_TIMEOUT_MS = 15000;
 
 export class ToolRegistry {
   /**
    * @param {Object} [opts]
    * @param {string|Object} [opts.profile='developer'] permission profile
    * @param {import('../security/sandbox.js').Sandbox} [opts.sandbox]
-   * @param {string} [opts.filesRoot] used when constructing a default sandbox
+   * @param {string} [opts.filesRoot]
    * @param {ApprovalManager} [opts.approvals]
-   * @param {Object} [opts.context] ambient agent context forwarded to handlers
+   * @param {Object} [opts.context] ambient ContextWindow forwarded through ToolContext
+   * @param {Object} [opts.config] tool configuration exposed through ToolContext
+   * @param {Object} [opts.memory] memory capability exposed through ToolContext
+   * @param {Array<Function|Object>} [opts.middleware] runner middleware
    */
   constructor(opts = {}) {
     /** @type {Map<string, Object>} */
     this._tools = new Map();
+    /** @type {Map<string, Object>} */
+    this._plugins = new Map();
+    /** @type {Map<string, Object>} */
+    this._discovered = new Map();
+
     this.profile = resolveProfile(opts.profile || process.env.SCRAPPYAI_PERMISSION_PROFILE || 'developer');
     this.sandbox = opts.sandbox || createSandbox({
       rootDir: opts.filesRoot || process.env.SCRAPPYAI_FILES_ROOT || process.cwd(),
@@ -92,15 +84,174 @@ export class ToolRegistry {
     });
     this.approvals = opts.approvals || new ApprovalManager();
     this.context = opts.context || null;
-    /** @type {Map<string, Object>} discovered-but-not-registered tool drafts */
-    this._discovered = new Map();
+    this.config = opts.config || {};
+    this.memory = opts.memory ?? null;
+    this.capabilities = opts.capabilities || {};
+
+    this.runner = opts.runner || new ToolRunner({
+      registry: this,
+      defaultTimeoutMs: opts.defaultTimeoutMs,
+      config: this.config,
+      memory: this.memory,
+      middleware: opts.middleware,
+    });
+    // A supplied runner is still attached to this registry so it can discover
+    // records without importing Registry (avoids a circular dependency).
+    if (opts.runner) this.runner.registry = this;
+    // Descriptive alias for hosts that prefer the class name in their wiring.
+    this.toolRunner = this.runner;
   }
 
   /**
-   * Discover a tool without activating it — starts at DISCOVERED / DRAFT.
-   * Use promote()/activate() to walk it through the lifecycle.
-   * @param {ToolDefinition} def
+   * Register a single Tool. Both the new `{execute, inputSchema}` contract and
+   * the old `{handler, parameters}` form are accepted and normalized to one
+   * internal record.
    */
+  register(def, options = {}) {
+    return this._register(def, options);
+  }
+
+  _register(def, options = {}) {
+    if (!def || typeof def !== 'object') {
+      throw new ToolError('register() requires a tool definition object.');
+    }
+    if (typeof def.name !== 'string' || !def.name.trim()) {
+      throw new ToolError('Tool definition requires a non-empty string "name".');
+    }
+    if (typeof def.execute !== 'function' && typeof def.handler !== 'function') {
+      throw new ToolError(
+        `Tool "${def.name}" requires an "execute" function (legacy "handler" is also supported).`
+      );
+    }
+    if (this._tools.has(def.name)) {
+      throw new ToolError(`Tool "${def.name}" is already registered.`);
+    }
+
+    const definition = options.plugin
+      ? withPluginMetadata(def, options.plugin)
+      : def;
+
+    // Promote from a discovered draft if present.
+    let record;
+    if (this._discovered.has(definition.name)) {
+      record = this._discovered.get(definition.name);
+      this._discovered.delete(definition.name);
+      const merged = { ...record, ...definition };
+      record = this._buildRecord(merged, {
+        lifecycle: record.lifecycle,
+        autoActivate: false,
+      });
+    } else {
+      record = this._buildRecord(definition, {
+        lifecycle: definition.lifecycle || ToolLifecycle.DISCOVERED,
+        autoActivate: definition.autoActivate !== false && !definition.lifecycle,
+      });
+    }
+
+    if (definition.autoActivate !== false && !definition.lifecycle) {
+      promoteToActive(record, { approvedBy: definition.metadata?.approvedBy || 'system' });
+    } else if (definition.lifecycle) {
+      record.lifecycle = definition.lifecycle;
+    } else if (record.lifecycle === ToolLifecycle.APPROVED) {
+      transitionLifecycle(record, ToolLifecycle.REGISTERED);
+    } else if (record.lifecycle === ToolLifecycle.DISCOVERED) {
+      transitionLifecycle(record, ToolLifecycle.DRAFT);
+    }
+
+    // A manually supplied APPROVED lifecycle is still registered, not silently
+    // executable, until its normal lifecycle transition is completed.
+    if (record.lifecycle === ToolLifecycle.APPROVED) transitionLifecycle(record, ToolLifecycle.REGISTERED);
+
+    this._tools.set(definition.name, record);
+    log.info('register', {
+      name: definition.name,
+      parameters: Object.keys(record.parameters || {}),
+      timeoutMs: record.timeoutMs,
+      requiresApproval: record.requiresApproval,
+      lifecycle: record.lifecycle,
+      risk: record.risk,
+      permissions: record.permissions,
+      plugin: record.pluginName || null,
+      totalTools: this._tools.size,
+    });
+    return this;
+  }
+
+  /**
+   * Mount a static plugin. A plugin is only a named container; each contained
+   * Tool is registered independently and therefore follows the exact same
+   * pipeline as a custom Tool.
+   *
+   * @param {{name:string, tools:Object[], metadata?:Object}} plugin
+   */
+  use(plugin) {
+    if (!plugin || typeof plugin !== 'object') {
+      throw new ToolError('use() requires a plugin object.');
+    }
+    if (typeof plugin.name !== 'string' || !plugin.name.trim()) {
+      throw new ToolError('Plugin requires a non-empty string "name".');
+    }
+    if (!Array.isArray(plugin.tools)) {
+      throw new ToolError(`Plugin "${plugin.name}" requires a "tools" array.`);
+    }
+    if (this._plugins.has(plugin.name)) {
+      throw new ToolError(`Plugin "${plugin.name}" is already mounted.`);
+    }
+
+    const mounted = {
+      name: plugin.name,
+      metadata: cloneValue(plugin.metadata || {}),
+      tools: [],
+      plugin,
+    };
+    try {
+      for (const tool of plugin.tools) {
+        if (!tool || typeof tool !== 'object') {
+          throw new ToolError(`Plugin "${plugin.name}" contains an invalid tool.`);
+        }
+        this._register(tool, { plugin: mounted });
+        mounted.tools.push(tool.name);
+      }
+      this._plugins.set(plugin.name, mounted);
+      log.info('plugin:use', { name: plugin.name, tools: mounted.tools, metadata: mounted.metadata });
+      return this;
+    } catch (err) {
+      // Keep mounting atomic: a duplicate or malformed tool does not leave a
+      // half-mounted plugin behind.
+      for (const name of mounted.tools) this.unregister(name);
+      throw err;
+    }
+  }
+
+  /** Remove every Tool owned by a plugin. */
+  removePlugin(name) {
+    const mounted = this._plugins.get(name);
+    if (!mounted) return false;
+    for (const toolName of [...mounted.tools]) this.unregister(toolName);
+    this._plugins.delete(name);
+    log.info('plugin:remove', { name, tools: mounted.tools });
+    return true;
+  }
+
+  getPlugin(name) {
+    const mounted = this._plugins.get(name);
+    if (!mounted) return undefined;
+    return {
+      name: mounted.name,
+      metadata: cloneValue(mounted.metadata),
+      tools: [...mounted.tools],
+    };
+  }
+
+  listPlugins() {
+    return [...this._plugins.values()].map((mounted) => ({
+      name: mounted.name,
+      metadata: cloneValue(mounted.metadata),
+      tools: [...mounted.tools],
+    }));
+  }
+
+  /** Discover a lifecycle draft without activating it (legacy lifecycle API). */
   discover(def) {
     if (!def || typeof def !== 'object') {
       throw new ToolError('discover() requires a tool definition object.');
@@ -111,102 +262,21 @@ export class ToolRegistry {
     if (this._tools.has(def.name) || this._discovered.has(def.name)) {
       throw new ToolError(`Tool "${def.name}" is already known.`);
     }
-    const record = this._buildRecord(def, { lifecycle: ToolLifecycle.DISCOVERED, autoActivate: false });
+    const record = this._buildRecord(def, {
+      lifecycle: ToolLifecycle.DISCOVERED,
+      autoActivate: false,
+    });
     transitionLifecycle(record, ToolLifecycle.DRAFT);
     this._discovered.set(def.name, record);
     log.info('discover', { name: def.name, lifecycle: record.lifecycle });
     return this;
   }
 
-  /**
-   * Register a tool. By default walks the full lifecycle to ACTIVE so existing
-   * call sites keep working. Pass `autoActivate:false` (or a specific
-   * `lifecycle`) to stop earlier.
-   * @param {ToolDefinition} def
-   */
-  register(def) {
-    if (!def || typeof def !== 'object') {
-      throw new ToolError('register() requires a tool definition object.');
-    }
-    if (typeof def.name !== 'string' || !def.name.trim()) {
-      throw new ToolError('Tool definition requires a non-empty string "name".');
-    }
-    if (typeof def.handler !== 'function') {
-      throw new ToolError(`Tool "${def.name}" requires a "handler" function.`);
-    }
-    if (this._tools.has(def.name)) {
-      throw new ToolError(`Tool "${def.name}" is already registered.`);
-    }
-
-    // Promote from discovered draft if present.
-    let record;
-    if (this._discovered.has(def.name)) {
-      record = this._discovered.get(def.name);
-      this._discovered.delete(def.name);
-      // Merge handler / fresher fields from def
-      Object.assign(record, this._buildRecord({ ...record, ...def }, { lifecycle: record.lifecycle, autoActivate: false }));
-    } else {
-      record = this._buildRecord(def, {
-        lifecycle: def.lifecycle || ToolLifecycle.DISCOVERED,
-        autoActivate: def.autoActivate !== false && !def.lifecycle,
-      });
-    }
-
-    if (def.autoActivate !== false && !def.lifecycle) {
-      promoteToActive(record, { approvedBy: def.metadata?.approvedBy || 'system' });
-    } else if (def.lifecycle) {
-      record.lifecycle = def.lifecycle;
-    } else {
-      // autoActivate:false — leave at DRAFT / current, but mark REGISTERED if already approved
-      if (record.lifecycle === ToolLifecycle.APPROVED) {
-        transitionLifecycle(record, ToolLifecycle.REGISTERED);
-      } else if (
-        record.lifecycle === ToolLifecycle.DISCOVERED ||
-        record.lifecycle === ToolLifecycle.DRAFT
-      ) {
-        // Ensure at least REGISTERED so it sits in the map; execution still gated by lifecycle.
-        if (record.lifecycle === ToolLifecycle.DISCOVERED) transitionLifecycle(record, ToolLifecycle.DRAFT);
-      }
-    }
-
-    // Always land in the main map once register() is called.
-    if (
-      record.lifecycle === ToolLifecycle.APPROVED ||
-      record.lifecycle === ToolLifecycle.DRAFT ||
-      record.lifecycle === ToolLifecycle.VALIDATING ||
-      record.lifecycle === ToolLifecycle.TESTING
-    ) {
-      // Move to REGISTERED if approved; otherwise keep and store.
-      if (record.lifecycle === ToolLifecycle.APPROVED) {
-        transitionLifecycle(record, ToolLifecycle.REGISTERED);
-      }
-    }
-
-    this._tools.set(def.name, record);
-    log.info('register', {
-      name: def.name,
-      parameters: Object.keys(def.parameters || {}),
-      timeoutMs: record.timeoutMs,
-      requiresApproval: record.requiresApproval,
-      lifecycle: record.lifecycle,
-      risk: record.risk,
-      permissions: record.permissions,
-      totalTools: this._tools.size,
-    });
-    return this;
-  }
-
-  /**
-   * Walk a registered (or discovered) tool to a new lifecycle state.
-   * @param {string} name
-   * @param {string} to
-   * @param {Object} [meta]
-   */
+  /** Walk a registered (or discovered) tool to a lifecycle state. */
   setLifecycle(name, to, meta = {}) {
     const tool = this._tools.get(name) || this._discovered.get(name);
     if (!tool) throw new ToolError(`Unknown tool "${name}".`, 'UNKNOWN_TOOL');
     transitionLifecycle(tool, to, meta);
-    // If moved to REMOVED, drop from active map.
     if (to === ToolLifecycle.REMOVED) {
       this._tools.delete(name);
       this._discovered.delete(name);
@@ -217,36 +287,31 @@ export class ToolRegistry {
     return tool;
   }
 
-  /** Activate a registered tool (REGISTERED → ACTIVE). */
   activate(name) {
     const tool = this._tools.get(name);
     if (!tool) throw new ToolError(`Unknown tool "${name}".`, 'UNKNOWN_TOOL');
     if (tool.lifecycle === ToolLifecycle.ACTIVE) return tool;
-    if (tool.lifecycle === ToolLifecycle.REGISTERED) {
+    if (tool.lifecycle === ToolLifecycle.REGISTERED || tool.lifecycle === ToolLifecycle.DEPRECATED) {
       return this.setLifecycle(name, ToolLifecycle.ACTIVE);
     }
-    // Allow re-activation from DEPRECATED.
-    if (tool.lifecycle === ToolLifecycle.DEPRECATED) {
-      return this.setLifecycle(name, ToolLifecycle.ACTIVE);
-    }
-    // Full promote path for drafts.
     promoteToActive(tool);
     return tool;
   }
 
-  /** Deprecate a tool (still executable, warned). */
   deprecate(name, reason = null, replacedBy = null) {
     return this.setLifecycle(name, ToolLifecycle.DEPRECATED, { reason, replacedBy });
   }
 
-  /** Remove a tool permanently. */
   remove(name) {
     return this.setLifecycle(name, ToolLifecycle.REMOVED);
   }
 
-  /** Remove a registered tool. Returns true if it existed. (legacy alias) */
   unregister(name) {
     const existed = this._tools.delete(name) || this._discovered.delete(name);
+    // Remove the ownership reference without recursively unregistering.
+    for (const mounted of this._plugins.values()) {
+      mounted.tools = mounted.tools.filter((toolName) => toolName !== name);
+    }
     log.info('unregister', { name, existed, totalTools: this._tools.size });
     return existed;
   }
@@ -259,273 +324,118 @@ export class ToolRegistry {
     return this._tools.get(name);
   }
 
-  /**
-   * List tools. By default only non-removed registered tools.
-   * @param {Object} [opts]
-   * @param {string[]} [opts.lifecycle] filter by lifecycle states
-   * @param {boolean} [opts.includeDiscovered=false]
-   */
   list(opts = {}) {
     const out = Array.from(this._tools.values());
     if (opts.includeDiscovered) out.push(...this._discovered.values());
     if (Array.isArray(opts.lifecycle) && opts.lifecycle.length) {
-      return out.filter((t) => opts.lifecycle.includes(t.lifecycle));
+      return out.filter((tool) => opts.lifecycle.includes(tool.lifecycle));
     }
     return out;
   }
 
   /**
-   * Render tool definitions into a plain schema array suitable for feeding a
-   * reasoner/LLM. Only ACTIVE tools are advertised by default.
+   * Legacy/provider-shaped definitions. New Router/LLM integrations should
+   * use getDefinitions(), which exposes the canonical JSON Schema.
    */
   toSchema(opts = {}) {
     const lifecycles = opts.lifecycle || SCHEMA_LIFECYCLES;
-    return this.list({ lifecycle: lifecycles }).map((t) => ({
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-      // Extra metadata the model may find useful (harmless if ignored)
-      risk: t.risk,
-      requiresApproval: t.requiresApproval,
-    }));
+    return this.list({ lifecycle: lifecycles })
+      .filter((tool) => tool.enabled !== false)
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: cloneValue(tool.parameters),
+        risk: tool.risk,
+        requiresApproval: tool.requiresApproval,
+      }));
   }
 
   /**
-   * Full metadata dump for operator UIs / debugging.
+   * Public LLM definition surface. It contains only what is needed to choose
+   * and call a Tool; execute/handler, permissions, plugin internals and Agent
+   * state never enter the prompt.
    */
+  getDefinitions(opts = {}) {
+    const lifecycles = opts.lifecycle || SCHEMA_LIFECYCLES;
+    return this.list({ lifecycle: lifecycles })
+      .filter((tool) => opts.includeDisabled || tool.enabled !== false)
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: cloneValue(tool.inputSchema),
+      }));
+  }
+
   toMetadata() {
-    return this.list({ includeDiscovered: true }).map((t) => ({
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-      timeoutMs: t.timeoutMs,
-      requiresApproval: t.requiresApproval,
-      lifecycle: t.lifecycle,
-      risk: t.risk,
-      permissions: t.permissions,
-      metadata: t.metadata,
+    return this.list({ includeDiscovered: true }).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: cloneValue(tool.inputSchema),
+      parameters: cloneValue(tool.parameters),
+      timeoutMs: tool.timeoutMs,
+      enabled: tool.enabled,
+      requiresApproval: tool.requiresApproval,
+      lifecycle: tool.lifecycle,
+      risk: tool.risk,
+      permissions: cloneValue(tool.permissions),
+      plugin: tool.pluginName || null,
+      metadata: cloneValue(tool.metadata),
     }));
   }
 
-  /**
-   * Validate args against a tool's parameter schema.
-   * @returns {{ok:true}|{ok:false,errors:string[]}}
-   */
+  /** Central validation API (delegates only to the schema layer). */
   validate(name, args) {
     const tool = this._tools.get(name);
     if (!tool) return { ok: false, errors: [`Unknown tool "${name}".`] };
-
-    const errors = [];
-    const schema = tool.parameters || {};
-    const input = args && typeof args === 'object' ? args : {};
-
-    for (const [key, spec] of Object.entries(schema)) {
-      const present = Object.prototype.hasOwnProperty.call(input, key);
-      if (spec.required && !present) {
-        errors.push(`Missing required argument "${key}".`);
-        continue;
-      }
-      if (!present) continue;
-
-      const value = input[key];
-      if (spec.type && !matchesType(value, spec.type)) {
-        errors.push(`Argument "${key}" must be of type "${spec.type}", got "${typeOf(value)}".`);
-        continue;
-      }
-      if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
-        errors.push(`Argument "${key}" must be one of [${spec.enum.join(', ')}], got "${value}".`);
-      }
-    }
-
-    return errors.length ? { ok: false, errors } : { ok: true, errors: [] };
+    return validateInput(tool.inputSchema, args);
   }
 
-  /**
-   * Check whether the current profile allows executing this tool.
-   * @param {string} name
-   * @returns {{ok:true}|{ok:false,error:string,code:string,denied?:any[]}}
-   */
-  checkToolPermissions(name) {
+  checkToolPermissions(name, options = {}) {
     const tool = this._tools.get(name);
     if (!tool) return { ok: false, error: `Unknown tool "${name}".`, code: 'UNKNOWN_TOOL' };
-    return checkPermissions(tool.permissions, this.profile.permissions);
+    const granted = options.permissions
+      ? normalizePermissions(options.permissions)
+      : this.profile.permissions;
+    return checkPermissions(tool.permissions, granted);
   }
 
-  /**
-   * Whether a tool call should pause for approval under the current profile
-   * and session grants.
-   * @param {string} name
-   * @param {Object} [request]
-   * @returns {boolean}
-   */
   requiresApproval(name, request = {}) {
     const tool = this._tools.get(name);
     if (!tool) return false;
-
     const session = this.approvals.lookup({ tool: name, ...request });
     if (session === 'granted') return false;
     if (session === 'denied') return true;
-
     if (tool.requiresApproval) return true;
     return shouldRequireApproval(tool, this.profile);
   }
 
-  /**
-   * Swap the active permission profile (e.g. escalate to admin mid-session).
-   * @param {string|Object} profile
-   */
   setProfile(profile) {
     this.profile = resolveProfile(profile);
     log.info('profile:set', { name: this.profile.name, permissions: this.profile.permissions });
     return this.profile;
   }
 
-  /**
-   * Execute a tool by name with validation, permission check, lifecycle gate,
-   * timeout, and safe error capture. Never throws — always resolves to a
-   * result object.
-   *
-   * @param {string} name
-   * @param {object} args
-   * @param {Object} [runCtx]
-   * @param {AbortSignal} [runCtx.signal]
-   * @param {Object} [runCtx.context] ambient agent context
-   * @param {Object} [runCtx.task] current Task (if any)
-   * @param {Object} [runCtx.logger] override logger
-   * @param {Object} [runCtx.permissions] override granted permissions for this call
-   * @returns {Promise<{ok:boolean, data?:any, error?:string, code?:string, durationMs:number}>}
-   */
-  async execute(name, args, runCtx = {}) {
-    const startedAt = Date.now();
-    const tool = this._tools.get(name);
-    log.debug('execute:start', { name, args });
-
-    if (!tool) {
-      return this._fail(name, args, startedAt, `Unknown tool "${name}".`, 'UNKNOWN_TOOL');
-    }
-
-    // Lifecycle gate — only ACTIVE / DEPRECATED may run.
-    if (!EXECUTABLE_LIFECYCLES.includes(tool.lifecycle)) {
-      return this._fail(
-        name,
-        args,
-        startedAt,
-        `Tool "${name}" is not executable in lifecycle state "${tool.lifecycle}".`,
-        'TOOL_NOT_ACTIVE'
-      );
-    }
-
-    if (tool.lifecycle === ToolLifecycle.DEPRECATED) {
-      log.warn('execute:deprecated', {
-        name,
-        replacedBy: tool.metadata?.replacedBy,
-        reason: tool.metadata?.deprecatedReason,
-      });
-    }
-
-    // Permission gate
-    const granted = runCtx.permissions
-      ? normalizePermissions(runCtx.permissions)
-      : this.profile.permissions;
-    const perm = checkPermissions(tool.permissions, granted);
-    if (!perm.ok) {
-      return this._fail(name, args, startedAt, perm.error, perm.code || 'PERMISSION_DENIED', { denied: perm.denied });
-    }
-
-    // Session denial
-    if (this.approvals.lookup({ tool: name }) === 'denied') {
-      return this._fail(name, args, startedAt, `Tool "${name}" is denied for this session.`, 'SESSION_DENIED');
-    }
-
-    // Already-aborted signal
-    if (runCtx.signal && runCtx.signal.aborted) {
-      return this._fail(name, args, startedAt, abortMessage(runCtx.signal), 'ABORTED');
-    }
-
-    const validation = this.validate(name, args);
-    if (!validation.ok) {
-      return this._fail(
-        name,
-        args,
-        startedAt,
-        `Invalid arguments for "${name}": ${validation.errors.join('; ')}`,
-        'VALIDATION_ERROR',
-        { errors: validation.errors }
-      );
-    }
-
-    // Build the rich handler context — every tool sees the same shape.
-    const handlerCtx = {
-      signal: runCtx.signal,
-      context: runCtx.context || this.context,
-      logger: runCtx.logger || createLogger(`tools:${name}`),
-      task: runCtx.task || null,
-      permissions: granted,
-      sandbox: this.sandbox,
-      tool: {
-        name: tool.name,
-        lifecycle: tool.lifecycle,
-        risk: tool.risk,
-        permissions: tool.permissions,
-        metadata: tool.metadata,
-      },
-      registry: this,
-    };
-
-    try {
-      const data = await runWithTimeoutAndSignal(
-        () => tool.handler(args || {}, handlerCtx),
-        tool.timeoutMs,
-        name,
-        runCtx.signal
-      );
-      const durationMs = Date.now() - startedAt;
-      const truncated = !!(data && typeof data === 'object' && data.truncated === true);
-      const result = {
-        ok: true,
-        data,
-        durationMs, // legacy top-level field, kept for compatibility
-        meta: { durationMs, source: name, truncated },
-      };
-      recordExecutionMetrics(tool, result);
-      log.info('execute:done', { name, args, ok: true, output: data, durationMs, lifecycle: tool.lifecycle });
-      return result;
-    } catch (err) {
-      const durationMs = Date.now() - startedAt;
-      const code = (err && err.code) || 'TOOL_EXECUTION_ERROR';
-      const message = err && err.message ? err.message : String(err);
-      const result = {
-        ok: false,
-        error: message,
-        code,
-        durationMs,
-        meta: { durationMs, source: name, truncated: false },
-        errorInfo: buildErrorInfo(code, message),
-      };
-      recordExecutionMetrics(tool, result);
-      log.error('execute:done', {
-        name,
-        args,
-        ok: false,
-        code: result.code,
-        error: result.error,
-        durationMs,
-      });
-      return result;
-    }
+  /** Standard execution API; business logic lives in ToolRunner. */
+  run(name, input, options = {}) {
+    return this.runner.run(name, input, options);
   }
 
   /**
-   * Execute many independent tool calls concurrently.
-   * @param {Array<{name:string, args?:object}>} calls
-   * @param {Object} [runCtx] same as execute(), plus concurrency/onError
+   * Legacy execution adapter. It preserves top-level `code` and string
+   * `error` fields for older Agent integrations; the runner itself remains
+   * standard and independently usable.
    */
+  async execute(name, args, runCtx = {}) {
+    const result = await this.run(name, args, runCtx);
+    return toLegacyResult(result);
+  }
+
   async executeParallel(calls, runCtx = {}) {
     const { parallel } = await import('../planning/parallel-executor.js');
     const { concurrency = 4, onError = 'collect', signal, ...rest } = runCtx;
     const summary = await parallel(
-      calls.map((c) => async ({ signal: s }) => {
-        const result = await this.execute(c.name, c.args || {}, { ...rest, signal: s });
+      calls.map((call) => async ({ signal: childSignal }) => {
+        const result = await this.execute(call.name, call.args || {}, { ...rest, signal: childSignal });
         if (!result.ok) {
           const err = new Error(result.error || 'tool failed');
           err.code = result.code;
@@ -536,177 +446,115 @@ export class ToolRegistry {
       }),
       { concurrency, onError, signal }
     );
-    // Re-shape: expose tool results directly
     return {
       ...summary,
-      results: summary.results.map((r, i) => {
-        if (r.ok) return { ...r.data, index: i, name: calls[i].name };
-        // Prefer the structured toolResult if the runner threw one
-        const tr = r.error && summary.failures; // fallthrough
+      results: summary.results.map((result, index) => {
+        if (result.ok) return { ...result.data, index, name: calls[index].name };
         return {
           ok: false,
-          index: i,
-          name: calls[i].name,
-          error: r.error,
-          code: r.code,
-          durationMs: r.durationMs,
-          attempts: r.attempts,
+          index,
+          name: calls[index].name,
+          error: result.error,
+          code: result.code,
+          durationMs: result.durationMs,
+          attempts: result.attempts,
         };
       }),
     };
   }
 
-  // --- internals -----------------------------------------------------------
-
-  _buildRecord(def, { lifecycle, autoActivate }) {
-    const permissions = resolveToolPermissions(def);
-    const risk = resolveToolRisk(def);
-    const metadata = createToolMetadata({
-      ...(def.metadata || {}),
-      permissions,
-      requiresApproval: !!def.requiresApproval,
-      risk,
-      category: def.metadata?.category || def.category || inferCategory(def.name),
-      tags: def.metadata?.tags || def.tags,
-      version: def.metadata?.version || def.version,
-      author: def.metadata?.author || def.author,
-      sideEffects: def.metadata?.sideEffects || def.sideEffects,
-    });
-
-    return {
-      name: def.name,
-      description: def.description || '',
-      parameters: def.parameters || {},
-      inputSchema: def.inputSchema || def.parameters || {},
-      outputSchema: def.outputSchema || null,
-      handler: def.handler,
-      timeoutMs: def.timeoutMs || DEFAULT_TIMEOUT_MS,
-      requiresApproval: !!def.requiresApproval || risk === 'critical',
-      permissions,
-      risk,
-      metadata,
-      lifecycle: lifecycle || ToolLifecycle.DISCOVERED,
-      autoActivate: autoActivate !== false,
-    };
-  }
-
-  _fail(name, args, startedAt, error, code, extra = {}) {
-    const result = {
-      ok: false,
-      error,
-      code,
-      durationMs: Date.now() - startedAt,
-      meta: { durationMs: Date.now() - startedAt, source: name, truncated: false },
-      errorInfo: buildErrorInfo(code, error),
-      ...extra,
-    };
-    log.warn('execute:done', { name, args, ok: false, code, error, durationMs: result.durationMs });
-    return result;
-  }
-
-  /**
-   * Inspect a tool's versioned contract: name, semantic version, and
-   * input/output schemas. If a tool changes, its schema version bumps so a
-   * caller can tell which contract it's talking to.
-   * @param {string} name
-   * @returns {{name:string, version:string, inputSchema:Object, outputSchema:Object, description:string}|null}
-   */
   toolContract(name) {
     const tool = this._tools.get(name);
     if (!tool) return null;
     return {
       name: tool.name,
       version: tool.metadata?.version || '0.0.0',
-      inputSchema: tool.inputSchema || tool.parameters || {},
-      outputSchema: tool.outputSchema || {},
+      inputSchema: cloneValue(tool.declaredInputSchema || tool.inputSchema),
+      outputSchema: cloneValue(tool.outputSchema || {}),
       description: tool.description || '',
     };
   }
 
-  /** @returns {Array<{name:string, version:string}>} all tool contracts (name + version) */
   listContracts() {
-    return [...this._tools.values()].map((t) => ({
-      name: t.name,
-      version: t.metadata?.version || '0.0.0',
+    return [...this._tools.values()].map((tool) => ({
+      name: tool.name,
+      version: tool.metadata?.version || '0.0.0',
     }));
+  }
+
+  _buildRecord(def, { lifecycle, autoActivate }) {
+    const rawInputSchema = def.inputSchema ?? def.parameters ?? {};
+    const inputSchema = normalizeInputSchema(rawInputSchema);
+    const parameters = def.parameters && !isCanonicalSchema(def.parameters)
+      ? cloneValue(def.parameters)
+      : legacyParametersFromSchema(inputSchema);
+    const category = def.metadata?.category || def.category || inferCategory(def.name);
+    const metadata = createToolMetadata({
+      ...(def.metadata || {}),
+      permissions: resolveToolPermissions(def),
+      requiresApproval: !!def.requiresApproval,
+      risk: resolveToolRisk(def),
+      category,
+      tags: def.metadata?.tags || def.tags,
+      version: def.metadata?.version || def.version,
+      author: def.metadata?.author || def.author,
+      sideEffects: def.metadata?.sideEffects || def.sideEffects,
+      traceName: def.metadata?.traceName || defaultTraceName(category),
+      source: def.metadata?.source || def.source || (def.pluginName ? 'plugin' : undefined),
+    });
+
+    return {
+      name: def.name,
+      description: def.description || '',
+      inputSchema,
+      // Keep the author-declared shape for the versioned contract API. The
+      // runner still uses normalized `inputSchema` for every validation call.
+      declaredInputSchema: def.inputSchema ? cloneValue(def.inputSchema) : null,
+      parameters,
+      outputSchema: def.outputSchema || null,
+      execute: def.execute || def.handler,
+      // The alias is intentionally retained for old inspection code. Runner
+      // calls `execute`, so both forms use the same execution pipeline.
+      handler: def.handler || def.execute,
+      timeoutMs: Number.isFinite(def.timeoutMs) ? def.timeoutMs : DEFAULT_TIMEOUT_MS,
+      enabled: def.enabled !== false,
+      disabled: def.enabled === false,
+      disabledReason: def.disabledReason || null,
+      requiresApproval: !!def.requiresApproval || resolveToolRisk(def) === 'critical',
+      permissions: resolveToolPermissions(def),
+      risk: resolveToolRisk(def),
+      metadata,
+      pluginName: def.pluginName || def.metadata?.plugin || null,
+      pluginMetadata: cloneValue(def.pluginMetadata || def.metadata?.pluginMetadata || null),
+      lifecycle: lifecycle || ToolLifecycle.DISCOVERED,
+      autoActivate: autoActivate !== false,
+    };
   }
 }
 
-/**
- * Build the structured errorInfo {code, message, retryable} attached to every
- * failed tool result. `retryable` is true only for generic execution errors
- * and transient transport failures — not for validation, permission, or
- * domain/redirect errors that a retry can never fix.
- */
-function buildErrorInfo(code, message) {
-  const retryable = RETRYABLE_ERROR_CODES.has(code);
-  return { code, message, retryable };
+function withPluginMetadata(def, plugin) {
+  const metadata = {
+    ...(def.metadata || {}),
+    source: def.metadata?.source || plugin.metadata?.source || 'plugin',
+    plugin: plugin.name,
+    ...(plugin.metadata?.category && !def.metadata?.category ? { category: plugin.metadata.category } : {}),
+    pluginMetadata: cloneValue(plugin.metadata || {}),
+  };
+  return {
+    ...def,
+    pluginName: plugin.name,
+    pluginMetadata: cloneValue(plugin.metadata || {}),
+    metadata,
+  };
 }
 
-/**
- * Codes a retry can plausibly fix. MUST NOT include network/timeout/DNS
- * errors (ECONNRESET, ECONNREFUSED, ETIMEDOUT, ENOTFOUND, REQUEST_FAILED,
- * TIMEOUT) — these indicate a dead endpoint where retrying wastes latency
- * and tokens. The system prompt's Fallback Rule and the loop-level
- * DEFAULT_TOOL_RETRY both enforce fail-fast so the reasoner pivots
- * immediately instead of burning budget on a dead endpoint.
- */
-const RETRYABLE_ERROR_CODES = new Set([
-  'TOOL_EXECUTION_ERROR',
-  'EXECUTION_ERROR',
-]);
-
-/**
- * Run fn() with a timeout AND AbortSignal. Aborting rejects with code ABORTED;
- * timeout rejects with TOOL_TIMEOUT. Both are cooperative for the timer; the
- * signal is also forwarded so the handler can stop in-flight I/O.
- */
-function runWithTimeoutAndSignal(fn, timeoutMs, toolName, signal) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-
-    const settle = (fnSettle, value) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      fnSettle(value);
-    };
-
-    const onAbort = () => {
-      settle(reject, Object.assign(new Error(`Tool "${toolName}" aborted.`), { code: 'ABORTED' }));
-    };
-
-    const timer = setTimeout(() => {
-      settle(
-        reject,
-        new ToolError(`Tool "${toolName}" timed out after ${timeoutMs}ms.`, 'TOOL_TIMEOUT')
-      );
-    }, timeoutMs);
-
-    const cleanup = () => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
-    };
-
-    if (signal) {
-      if (signal.aborted) {
-        onAbort();
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    Promise.resolve()
-      .then(fn)
-      .then((result) => settle(resolve, result))
-      .catch((err) => settle(reject, err));
-  });
-}
-
-function abortMessage(signal) {
-  if (signal && signal.reason && signal.reason.message) return signal.reason.message;
-  if (signal && typeof signal.reason === 'string') return signal.reason;
-  return 'aborted';
+function isCanonicalSchema(schema) {
+  return !!(
+    schema &&
+    typeof schema === 'object' &&
+    !Array.isArray(schema) &&
+    (schema.type === 'object' || schema.properties || Array.isArray(schema.required))
+  );
 }
 
 function inferCategory(name) {
@@ -716,43 +564,38 @@ function inferCategory(name) {
   if (/^code_/.test(name)) return 'code';
   if (/^(npm|package_)/.test(name)) return 'package';
   if (/^plan_/.test(name)) return 'planning';
+  if (/^spec_/.test(name)) return 'spec';
+  if (/^todo_/.test(name)) return 'todo';
   if (/^verify_/.test(name)) return 'verification';
-  if (/search|web_/.test(name)) return 'web';
+  if (/search|web_|^http_|^fetch_/.test(name)) return 'web';
   return 'general';
 }
 
-function typeOf(value) {
-  if (Array.isArray(value)) return 'array';
-  if (value === null) return 'null';
-  return typeof value;
+function defaultTraceName(category) {
+  if (category === 'web') return 'tool.search';
+  if (category === 'verification') return 'verification';
+  return `tool.${category || 'custom'}`;
 }
 
-function matchesType(value, type) {
-  switch (type) {
-    case 'array':
-      return Array.isArray(value);
-    case 'object':
-      return typeof value === 'object' && value !== null && !Array.isArray(value);
-    case 'string':
-      return typeof value === 'string';
-    case 'number':
-      return typeof value === 'number' && !Number.isNaN(value);
-    case 'boolean':
-      return typeof value === 'boolean';
-    default:
-      return true;
+function cloneValue(value) {
+  if (Array.isArray(value)) return value.map(cloneValue);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    // Function values cannot be part of a public schema/metadata clone.
+    if (typeof child !== 'function') out[key] = cloneValue(child);
   }
+  return out;
 }
 
-// Re-export lifecycle symbols so consumers can `import { ToolLifecycle } from './registry.js'`.
+// Re-export lifecycle and error symbols from the historical module path.
 export {
+  ToolError,
   ToolLifecycle,
   createToolMetadata,
   transitionLifecycle,
   promoteToActive,
-  canTransitionLifecycle,
   EXECUTABLE_LIFECYCLES,
-  SCHEMA_LIFECYCLES,
 };
 
 export default ToolRegistry;
