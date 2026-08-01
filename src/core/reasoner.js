@@ -280,6 +280,11 @@ export function createScriptedClient(script = []) {
 }
 
 function safeStringify(value) {
+  if (typeof value === 'string') return value;
+  // JSON.stringify(undefined) returns the *value* undefined (not a string),
+  // which would leak a non-string content into the provider-facing history.
+  // Guard it so this helper always returns a string.
+  if (value === undefined || value === null) return '';
   try {
     return JSON.stringify(value);
   } catch (_err) {

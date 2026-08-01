@@ -355,10 +355,19 @@ function toOpenAiMessages(systemPrompt, messages) {
   const out = [];
   if (systemPrompt) out.push({ role: 'system', content: systemPrompt });
   for (const m of messages || []) {
+    // DeepSeek (and several other OpenAI-compatible gateways) reject
+    // `content: null` outright with "invalid type: null, expected a string".
+    // An assistant turn that only emits tool_calls legitimately has *no text*
+    // content — the reasoner stores it as an empty string (''), but a naive
+    // `content || null` collapses that to JSON null and the provider dies on
+    // it. Coerce to a string everywhere so no message ever carries a
+    // null/undefined content: '' is universally accepted and semantically
+    // identical (no text) for an assistant turn with tool_calls.
+    const content = typeof m.content === 'string' ? m.content : '';
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       out.push({
         role: 'assistant',
-        content: m.content || null,
+        content,
         tool_calls: m.tool_calls.map((tc) => ({
           id: tc.id,
           type: 'function',
@@ -366,9 +375,9 @@ function toOpenAiMessages(systemPrompt, messages) {
         })),
       });
     } else if (m.role === 'tool') {
-      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content: m.content });
+      out.push({ role: 'tool', tool_call_id: m.tool_call_id, content });
     } else {
-      out.push({ role: m.role, content: m.content });
+      out.push({ role: m.role, content });
     }
   }
   return out;
