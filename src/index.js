@@ -27,6 +27,10 @@ import { createFileTools } from './tools/files.js';
 import { createWebSearchTool } from './tools/search.js';
 import { createCodeTools } from './tools/code.js';
 import { createPackageTools } from './tools/package.js';
+import { createPlanningTools } from './tools/planning.js';
+import { createVerificationTools } from './tools/verification.js';
+import { PlanningEngine } from './planning.js';
+import { VerificationEngine } from './verification.js';
 import { runRepl } from './repl.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory-integration.js';
@@ -54,6 +58,20 @@ const DEFAULT_SYSTEM_PROMPT = [
   '  episodes. Treat it as ground truth you already know - use it, do not ',
   '  re-ask for it, and never contradict a confirmed fact without saying so.',
   '',
+  'Planning and Verification rules:',
+  '- For multi-step implementation tasks (e.g. creating web servers, multi-file apps), ',
+  '  use plan_create to define a clear step-by-step execution plan and update task ',
+  '  statuses as you progress.',
+  '- Always verify created files, server ports, or code syntax using verification ',
+  '  tools (verify_file, verify_command, verify_json, verify_suite) rather than ',
+  '  repeating shell execution calls.',
+  '',
+  'Node.js & Execution rules:',
+  '- Check package.json "type" field: if "type": "module" is present, JS files default ',
+  '  to ES Modules (use ESM import/export or .cjs extension for CommonJS require).',
+  '- Shell commands with pipes (|), redirection (>), or logical operators (&&, ||) ',
+  '  MUST set useShell: true.',
+  '',
   'Efficiency and latency rules:',
   '- Cheapest sufficient tool first. If a web_search snippet already contains ',
   '  enough to answer, STOP there - do not call heavier tools (fetch/curl, ',
@@ -72,7 +90,9 @@ const DEFAULT_SYSTEM_PROMPT = [
   '',
   'Toolset: file tools (read/write/edit/list/search/mkdir/move/copy/delete, all ',
   'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
-  '(run/test/validate), package tools (npm/install/package_info), and web_search. ',
+  '(run/test/validate), package tools (npm/install/package_info), planning tools ',
+  '(plan_create/plan_update_task/plan_get/plan_add_tasks), verification tools ',
+  '(verify_file/verify_command/verify_json/verify_suite), and web_search. ',
   'Destructive actions (delete_file, shell_kill) wait for human approval.',
   '',
   'Be direct and concrete. State what you did and what remains; do not ',
@@ -155,6 +175,12 @@ export function createDefaultToolRegistry(opts = {}) {
 
   // package suite (3 tools)
   for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
+
+  // planning suite (4 tools)
+  for (const def of createPlanningTools({ engine: opts.planningEngine })) registry.register(def);
+
+  // verification suite (4 tools)
+  for (const def of createVerificationTools({ rootDir: filesRoot, engine: opts.verificationEngine })) registry.register(def);
 
   registry.register(createWebSearchTool());
 
@@ -344,5 +370,12 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(pro
 if (isMain) {
   main();
 }
+
+export {
+  createPlanningTools,
+  createVerificationTools,
+  PlanningEngine,
+  VerificationEngine,
+};
 
 export default buildAgent;

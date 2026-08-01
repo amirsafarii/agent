@@ -20,6 +20,7 @@ import { execa } from 'execa';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { access, constants as fsConstants } from 'node:fs/promises';
+import { mkdirSync } from 'node:fs';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('tools:shell');
@@ -85,8 +86,7 @@ export function createShellTool(opts = {}) {
         throw shellError(`Binary "${bin}" is not in the shell tool allowlist.`, 'NOT_ALLOWLISTED');
       }
 
-      const runCwd = args.cwd || cwd;
-      enforceSandboxCwd(runCwd, sandboxRoot);
+      const runCwd = resolveRunCwd(args.cwd, cwd, sandboxRoot);
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
       const startedAt = Date.now();
       log.info('shell:start', { command: commandLine, cwd: runCwd, timeoutMs: runTimeout, useShell: !!args.useShell });
@@ -161,8 +161,7 @@ export function createShellSpawnTool(opts = {}) {
       if (Array.isArray(allow) && !allow.includes(bin)) {
         throw shellError(`Binary "${bin}" is not in the shell tool allowlist.`, 'NOT_ALLOWLISTED');
       }
-      const runCwd = args.cwd || cwd;
-      enforceSandboxCwd(runCwd, sandboxRoot);
+      const runCwd = resolveRunCwd(args.cwd, cwd, sandboxRoot);
 
       log.info('shell_spawn:start', { command: commandLine, cwd: runCwd });
       const child = spawn(bin, rest, { cwd: runCwd, detached: true, stdio: 'ignore' });
@@ -262,15 +261,24 @@ export function createShellWhichTool() {
   };
 }
 
-/** Reject a cwd that escapes the sandbox root when one is configured. */
-function enforceSandboxCwd(runCwd, sandboxRoot) {
-  if (!sandboxRoot) return;
-  const root = path.resolve(sandboxRoot);
-  const resolved = path.resolve(runCwd);
-  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
-  if (resolved !== root && !resolved.startsWith(rootWithSep)) {
-    throw shellError(`cwd "${runCwd}" escapes sandbox root "${root}".`, 'CWD_ESCAPE');
+/** Resolve working directory relative to sandbox root or default cwd, and enforce sandbox bounds. */
+function resolveRunCwd(argsCwd, defaultCwd, sandboxRoot) {
+  const base = sandboxRoot ? path.resolve(sandboxRoot) : path.resolve(defaultCwd);
+  const resolved = argsCwd ? path.resolve(base, argsCwd) : base;
+
+  if (sandboxRoot) {
+    const root = path.resolve(sandboxRoot);
+    const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+    if (resolved !== root && !resolved.startsWith(rootWithSep)) {
+      throw shellError(`cwd "${argsCwd}" escapes sandbox root "${root}".`, 'CWD_ESCAPE');
+    }
   }
+
+  try {
+    mkdirSync(resolved, { recursive: true });
+  } catch (_err) {}
+
+  return resolved;
 }
 
 export function splitCommand(commandLine) {
