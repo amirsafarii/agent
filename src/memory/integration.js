@@ -47,7 +47,7 @@ export function wireMemory(agent, { memoryManager, extractor, userId = 'local', 
 
     const outcome = await originalRun(userInput, runOpts);
 
-    await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput, outcome, onEvent: emitEvent });
+    await recordTurn({ agent, memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput, outcome, onEvent: emitEvent });
 
     return outcome;
   };
@@ -64,7 +64,7 @@ export function wireMemory(agent, { memoryManager, extractor, userId = 'local', 
       }
       const outcome = await originalResume(checkpointObj, runOpts);
       if (query) {
-        await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
+        await recordTurn({ agent, memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
       }
       return outcome;
     };
@@ -77,7 +77,7 @@ export function wireMemory(agent, { memoryManager, extractor, userId = 'local', 
       }
       const outcome = await originalResumeWithApproval(checkpointObj, approved, runOpts);
       if (query) {
-        await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
+        await recordTurn({ agent, memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
       }
       return outcome;
     };
@@ -115,26 +115,30 @@ async function injectRelevantMemory({ agent, memoryManager, userId, sessionId, p
     const injected = { sessionId, userId, query, facts: confirmedFacts.length, semantic: related.semantic?.length || 0, episodes: related.episodes?.length || 0 };
     log.info('inject:done', injected);
     emit(onEvent, 'memory_inject', injected);
+    agent.eventBus?.publish('agent.memory.injected', injected);
   } catch (err) {
     log.warn('inject:failed', { sessionId, userId, error: err.message });
     emit(onEvent, 'memory_error', { phase: 'inject', error: err.message });
   }
 }
 
-async function recordTurn({ memoryManager, extractor, userId, sessionId, projectId, userInput, outcome, onEvent }) {
+async function recordTurn({ agent, memoryManager, extractor, userId, sessionId, projectId, userInput, outcome, onEvent }) {
   try {
     const turnId = await memoryManager.recordTurn({ sessionId, userId, role: 'user', content: userInput });
     if (outcome.status === 'final') {
       await memoryManager.recordTurn({ sessionId, userId, role: 'assistant', content: outcome.content });
     }
 
+    let factsPromoted = 0;
     if (extractor) {
       const result = await extractor.extractFromTurn({ userId, sessionId, projectId, turnId, userMessage: userInput });
       if (result.factsPromoted) {
+        factsPromoted = result.factsPromoted;
         log.info('record:facts_promoted', { sessionId, userId, count: result.factsPromoted });
         emit(onEvent, 'memory_learned', { sessionId, count: result.factsPromoted });
       }
     }
+    agent?.eventBus?.publish('agent.memory.updated', { sessionId, userId, count: factsPromoted });
     log.debug('record:done', { sessionId, userId, turnId, outcomeStatus: outcome.status });
   } catch (err) {
     log.warn('record:failed', { sessionId, userId, error: err.message });
