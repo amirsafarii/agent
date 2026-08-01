@@ -16,6 +16,9 @@
 
 import { randomUUID } from 'node:crypto';
 import { createLogger } from './logger.js';
+import { DAG, GoalDecomposer, TaskTree, DAGExecutor } from './planning/index.js';
+
+export { DAG, GoalDecomposer, TaskTree, DAGExecutor };
 
 const log = createLogger('planning');
 

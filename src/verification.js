@@ -18,6 +18,9 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { execa } from 'execa';
 import { createLogger } from './logger.js';
+import { VerificationPipeline, validateFile, validateCommand, validateJson, assertPathInSandbox } from './verification/index.js';
+
+export { VerificationPipeline, validateFile, validateCommand, validateJson, assertPathInSandbox };
 
 const log = createLogger('verification');
 

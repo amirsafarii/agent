@@ -3,9 +3,27 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VerificationEngine } from '../src/verification.js';
+import { VerificationEngine, VerificationPipeline } from '../src/verification.js';
 import { createVerificationTools } from '../src/tools/verification.js';
 import { ToolRegistry } from '../src/tools.js';
+
+test('VerificationPipeline: execute pipeline stages', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'scrappyai-verif-pipe-'));
+  writeFileSync(join(root, 'server.js'), 'console.log("server running");');
+  writeFileSync(join(root, 'package.json'), '{"name": "server"}');
+
+  const pipeline = new VerificationPipeline({ rootDir: root });
+  pipeline
+    .addStage({ name: 'file-check', type: 'file', path: 'server.js', contains: 'server running' })
+    .addStage({ name: 'json-check', type: 'json', path: 'package.json', requiredKeys: ['name'] })
+    .addStage({ name: 'cmd-check', type: 'command', command: 'node server.js', stdoutContains: 'server running' });
+
+  const report = await pipeline.run();
+  assert.equal(report.ok, true);
+  assert.equal(report.totalStages, 3);
+  assert.equal(report.passed, 3);
+  assert.equal(report.failed, 0);
+});
 
 test('VerificationEngine: file verification and path escape protection', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scrappyai-verif-'));

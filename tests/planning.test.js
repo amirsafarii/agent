@@ -1,8 +1,69 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PlanningEngine } from '../src/planning.js';
+import { PlanningEngine, DAG, GoalDecomposer, TaskTree, DAGExecutor } from '../src/planning.js';
 import { createPlanningTools } from '../src/tools/planning.js';
 import { ToolRegistry } from '../src/tools.js';
+
+test('DAG: cycle detection, topological sort, ready nodes', () => {
+  const dag = new DAG();
+  dag.addNode('1', { title: 'First' });
+  dag.addNode('2', { title: 'Second' });
+  dag.addNode('3', { title: 'Third' });
+
+  dag.addEdge('1', '2');
+  dag.addEdge('2', '3');
+
+  assert.equal(dag.hasCycle(), false);
+  assert.deepEqual(dag.topologicalSort(), ['1', '2', '3']);
+
+  const initialReady = dag.getReadyNodes([]);
+  assert.equal(initialReady.length, 1);
+  assert.equal(initialReady[0].id, '1');
+
+  const afterFirstReady = dag.getReadyNodes(['1']);
+  assert.equal(afterFirstReady.length, 1);
+  assert.equal(afterFirstReady[0].id, '2');
+
+  assert.throws(() => dag.addEdge('3', '1'), /cycle/i);
+});
+
+test('GoalDecomposer & TaskTree: decompose goal into hierarchy & DAG', () => {
+  const decomposer = new GoalDecomposer();
+  const decomposed = decomposer.decompose({
+    title: 'Deploy Service',
+    tasks: [
+      { id: '1', title: 'Write Dockerfile' },
+      { id: '2', title: 'Build Image', deps: ['1'] },
+      { id: '3', title: 'Push Image', deps: ['2'] },
+    ],
+  });
+
+  assert.equal(decomposed.goalTitle, 'Deploy Service');
+  assert.equal(decomposed.dag.nodes.size, 3);
+  assert.equal(decomposed.taskTree.nodes.size, 4); // root + 3 tasks
+
+  const treeObj = decomposed.taskTree.toTreeObject();
+  assert.equal(treeObj.children.length, 3);
+});
+
+test('DAGExecutor: execute tasks in topological order', async () => {
+  const dag = new DAG();
+  dag.addEdge('A', 'B');
+  dag.addEdge('B', 'C');
+
+  const executedOrder = [];
+  const executor = new DAGExecutor({
+    dag,
+    taskRunner: async (node) => {
+      executedOrder.push(node.id);
+      return { ok: true };
+    },
+  });
+
+  const res = await executor.executeAll();
+  assert.equal(res.ok, true);
+  assert.deepEqual(executedOrder, ['A', 'B', 'C']);
+});
 
 test('PlanningEngine: create, update, progress, and next actionable tasks', () => {
   const engine = new PlanningEngine();

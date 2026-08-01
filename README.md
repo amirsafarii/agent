@@ -12,7 +12,9 @@ src/
 ├── reasoner.js             ← pluggable LLM adapter + native tool_call_id history,
 │                              + streaming (createReasoner)
 ├── planning.js             ← multi-step execution plans and subtask tracking (PlanningEngine)
+├── planning/               ← DAG, goal-decomposer, task-tree, dag-executor
 ├── verification.js         ← file/command/JSON/suite validation checks (VerificationEngine)
+├── verification/           ← verification-pipeline, validators
 ├── checkpoint-manager.js   ← every checkpoint addressable by id, in memory + on disk
 ├── session-logger.js       ← per-session events.jsonl + transcript.log on disk
 ├── trace.js                ← Claude-Code-style colored terminal trace + scratchpad renderer
@@ -34,8 +36,8 @@ tests/
 │                              SessionLogger
 ├── 9router.test.js         ← stream:false, NDJSON/SSE recovery, HTTP errors, mapping
 ├── tools.test.js           ← ToolRegistry + real shell/files behavior + stubbed search
-├── planning.test.js        ← PlanningEngine + task progress & subtask tool suite
-├── verification.test.js    ← VerificationEngine + file/command/JSON/suite test runner
+├── planning.test.js        ← PlanningEngine + DAG + GoalDecomposer + TaskTree + DAGExecutor
+├── verification.test.js    ← VerificationEngine + VerificationPipeline + validators
 ├── memory.test.js          ← all seven layers + extractor + wireMemory degrade
 ├── streaming.test.js       ← chatStream SSE accumulation + streamed AgentLoop turns
 ├── logger.test.js          ← redaction + clipping
@@ -47,7 +49,7 @@ tests/
 ```
 npm test
 ```
-(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **148 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
+(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **152 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
 
 ## Wiring it together
 

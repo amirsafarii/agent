@@ -20,7 +20,7 @@
  * Pure JavaScript (ES modules), Node's built-in fs/promises only.
  */
 
-import { promises as fs } from 'node:fs';
+import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { createLogger } from '../logger.js';
 
@@ -50,6 +50,9 @@ export function createFilesystemTools(opts = {}) {
   } = opts;
 
   const root = path.resolve(rootDir);
+  try {
+    mkdirSync(root, { recursive: true });
+  } catch (_err) {}
 
   function resolveSafe(relPath) {
     if (typeof relPath !== 'string' || !relPath.trim()) {
