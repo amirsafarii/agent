@@ -63,11 +63,17 @@ export class RetryPolicy {
   }
 }
 
-// Default policies for specific tools
+// Default policies for specific tools.
+// CRITICAL: retryable errors here MUST NOT include network/timeout/DNS codes
+// (HTTP_ERROR, REQUEST_FAILED, TOOL_TIMEOUT, ETIMEDOUT, ENOTFOUND,
+// ECONNREFUSED, ECONNRESET). The system prompt's "Fallback Rule" and the
+// loop-level DEFAULT_TOOL_RETRY both enforce fail-fast for dead endpoints
+// so the reasoner can pivot immediately. Retrying a dead endpoint wastes
+// latency and tokens — the reasoner must choose a different approach.
 export const DEFAULT_TOOL_POLICIES = {
   web_search: new RetryPolicy({
-    maxAttempts: 3,
-    retryableErrors: ['TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR', 'HTTP_ERROR', 'REQUEST_FAILED', 'TOOL_TIMEOUT'],
+    maxAttempts: 2,
+    retryableErrors: ['TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR'],
   }),
   npm: new RetryPolicy({
     maxAttempts: 2,
@@ -78,11 +84,11 @@ export const DEFAULT_TOOL_POLICIES = {
     retryableErrors: ['TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR'],
   }),
   delete_file: new RetryPolicy({
-    maxAttempts: 1, // never retry
+    maxAttempts: 1, // never retry — destructive
     retryableErrors: [],
   }),
   payment: new RetryPolicy({
-    maxAttempts: 1, // never retry automatic
+    maxAttempts: 1, // never retry automatically
     retryableErrors: [],
   }),
 };

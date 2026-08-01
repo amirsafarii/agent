@@ -357,7 +357,12 @@ export class TodoManager {
     return this.items.length === 0;
   }
 
-  /** Current progress summary (returned by every mutation and by status()). */
+  /**
+   * Current progress summary (returned by every mutation and by status()).
+   * IMPORTANT: `canFinish` here MUST agree with the canFinish() method — both
+   * use the same `looksLikeCode` heuristic to decide if a completed+verified
+   * item needs tests. This prevents contradictory signals to the reasoner.
+   */
   summary() {
     const total = this.items.length;
     const completed = this.items.filter((i) => i.status === TodoStatus.COMPLETED).length;
@@ -365,9 +370,14 @@ export class TodoManager {
     const inProgress = this.items.filter((i) => i.status === TodoStatus.IN_PROGRESS).length;
     const pending = this.items.filter((i) => i.status === TodoStatus.PENDING).length;
     const unverified = this.items.filter((i) => i.status === TodoStatus.COMPLETED && !i.verified).length;
-    const untested = this.items.filter((i) => i.status === TodoStatus.COMPLETED && i.verified && !i.testPassed).length;
+    // Only count code-like tasks as "untested" to match canFinish() behavior.
+    const untested = this.items.filter((i) => {
+      if (i.status !== TodoStatus.COMPLETED || !i.verified || i.testPassed) return false;
+      return /\b(file|code|implement|function|module|class|api|route|test|build|feature|tool)\b/i.test(i.text);
+    }).length;
     const pct = total > 0 ? Math.round(((completed + skipped) / total) * 100) : 0;
-    const canFinish = total > 0 && (completed + skipped) === total && unverified === 0 && untested === 0;
+    // Use the actual canFinish() method to ensure consistency.
+    const canFinishResult = this.canFinish();
     return {
       path: this.absolutePath,
       total,
@@ -378,7 +388,7 @@ export class TodoManager {
       unverified,
       untested,
       percentage: pct,
-      canFinish,
+      canFinish: canFinishResult.ok,
       nextActionable: this._nextActionable().slice(0, 5),
       items: this.items.map((i) => ({ ...i })),
     };

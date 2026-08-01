@@ -58,7 +58,7 @@ const DEFAULT_TOOL_RETRY = Object.freeze({
 
 const DEFAULT_MAX_TASK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes wall clock per run()
 const DEFAULT_MAX_CONSECUTIVE_TOOL_EXHAUSTION = 2;
-const DEFAULT_MAX_TOOL_CALLS_PER_TOOL = 8; // hard per-run cap per tool name
+const DEFAULT_MAX_TOOL_CALLS_PER_TOOL = 20; // hard per-run cap per tool name — must accommodate legitimate multi-file work
 const DEFAULT_SIMILAR_WINDOW = 8; // how many recent tool calls to compare for similarity warnings
 
 export class AgentLoop {
@@ -203,7 +203,8 @@ export class AgentLoop {
     this._toolCallCounts = {}; // per-tool call counter for the tool-overuse guard
     this._similarCallHistory = []; // normalized fingerprints of recent calls, for similarity warnings
     this._stepMemory = []; // structured, non-chat record of every step — see docs/LOOP.md StepRecord
-    this._consecutiveToolExhaustion = 0;
+    this._consecutiveToolExhaustion = 0; // resets on any successful tool call
+    this._totalToolExhaustion = 0; // monotonically increasing per run; catches alternating broken tools
     this._pauseRequested = false;
     this._currentStep = 0;
     this._lastStartedAt = Date.now();
@@ -332,7 +333,13 @@ export class AgentLoop {
     }
   }
 
-  /** Move the state machine forward; a bad transition is logged, never thrown into the loop. */
+  /**
+   * Move the state machine forward. Invalid transitions are logged as errors
+   * (not warnings) and emitted via LoopEvents.ERROR so observability surfaces
+   * them prominently — a bad transition is a bug, not a routine occurrence.
+   * Never throws into the loop body (the loop must not crash on a bookkeeping
+   * error), but the error event makes the problem visible.
+   */
   _safeTransition(to, meta = {}) {
     try {
       this.state.transition(to, meta);
@@ -340,7 +347,8 @@ export class AgentLoop {
       const hookName = AgentLoop.LIFECYCLE_HOOK_NAMES[to];
       if (hookName) this._fireLifecycleHook(hookName, { state: to, meta, step: this._currentStep });
     } catch (err) {
-      log.warn('state:invalid_transition', { to, current: this.state.current, error: err.message });
+      log.error('state:invalid_transition', { to, current: this.state.current, error: err.message, step: this._currentStep });
+      this._emit(LoopEvents.ERROR, { phase: 'state_transition', error: err.message, to, current: this.state.current });
     }
   }
 
@@ -436,6 +444,7 @@ export class AgentLoop {
       similarCallHistory: this._similarCallHistory.slice(),
       stepMemory: this.getStepMemory(),
       consecutiveToolExhaustion: this._consecutiveToolExhaustion,
+      totalToolExhaustion: this._totalToolExhaustion,
       context: this.context.toJSON(),
       state: this.state.current,
       pendingApproval: meta.pendingApproval || null,
@@ -527,6 +536,7 @@ export class AgentLoop {
     this._toolCallCounts = checkpointObj.toolCallCounts && typeof checkpointObj.toolCallCounts === 'object' ? { ...checkpointObj.toolCallCounts } : {};
     this._similarCallHistory = Array.isArray(checkpointObj.similarCallHistory) ? checkpointObj.similarCallHistory.slice() : [];
     this._consecutiveToolExhaustion = checkpointObj.consecutiveToolExhaustion || 0;
+    this._totalToolExhaustion = checkpointObj.totalToolExhaustion || 0;
     this._lastBudget = checkpointObj.budget ?? null;
     this._pauseRequested = false;
   }
@@ -546,8 +556,17 @@ export class AgentLoop {
     return loop;
   }
 
+  /**
+   * Build a stable fingerprint for stuck-loop detection. For parallel
+   * batches, each tool's individual args are included so two parallel calls
+   * with the same tool names but different args are NOT treated as identical.
+   */
   _fingerprint(action) {
-    return `${action.tool}:${JSON.stringify(action.args ?? {})}`;
+    if (Array.isArray(action.tools) && action.tools.length > 0) {
+      // Parallel: fingerprint includes each tool's name + args
+      return `parallel:${action.tools.map((t) => `${t.tool}:${normalizeArgs(t.args)}`).join('|')}`;
+    }
+    return `${action.tool}:${normalizeArgs(action.args)}`;
   }
 
   _isStuck(action) {
@@ -636,6 +655,7 @@ export class AgentLoop {
       this._similarCallHistory = [];
       this._stepMemory = [];
       this._consecutiveToolExhaustion = 0;
+      this._totalToolExhaustion = 0;
       // Fresh Run — separate concept from Task. One run() == one Run.
       this.currentRun = new Run({
         input: userInput != null ? String(userInput) : null,
@@ -821,13 +841,23 @@ export class AgentLoop {
         // Counts every call per tool NAME for the whole run — different args
         // count, so flailing on one tool (endless search variants) is capped
         // while a legitimate multi-step build is not.
-        this._toolCallCounts[action.tool] = (this._toolCallCounts[action.tool] || 0) + 1;
-        if (this._toolCallCounts[action.tool] > this.maxToolCallsPerTool) {
-          const msg = `Tool "${action.tool}" has been called ${this._toolCallCounts[action.tool]} times this run (limit ${this.maxToolCallsPerTool}) - stopping instead of burning tokens on repeated use of one tool.`;
+        // For parallel batches, count EACH tool in the batch, not just the first.
+        const toolsToCount = Array.isArray(action.tools) && action.tools.length > 0
+          ? action.tools.map((t) => t.tool)
+          : [action.tool];
+        let overuseTool = null;
+        for (const toolName of toolsToCount) {
+          this._toolCallCounts[toolName] = (this._toolCallCounts[toolName] || 0) + 1;
+          if (this._toolCallCounts[toolName] > this.maxToolCallsPerTool && !overuseTool) {
+            overuseTool = toolName;
+          }
+        }
+        if (overuseTool) {
+          const msg = `Tool "${overuseTool}" has been called ${this._toolCallCounts[overuseTool]} times this run (limit ${this.maxToolCallsPerTool}) - stopping instead of burning tokens on repeated use of one tool.`;
           await this.context.append({ role: 'system', content: `[loop guard] ${msg}` });
           this._recordStep({ step, phase: 'tool_overuse', action, error: msg, durationMs: 0 });
-          this._emit(LoopEvents.TOOL_OVERUSE, { step, tool: action.tool, calls: this._toolCallCounts[action.tool], error: msg });
-          log.error('step:tool_overuse', { step, tool: action.tool, calls: this._toolCallCounts[action.tool], error: msg });
+          this._emit(LoopEvents.TOOL_OVERUSE, { step, tool: overuseTool, calls: this._toolCallCounts[overuseTool], error: msg });
+          log.error('step:tool_overuse', { step, tool: overuseTool, calls: this._toolCallCounts[overuseTool], error: msg });
           this._safeTransition(LoopState.FAILED, { reason: 'tool_overuse' });
           return this._terminate({ status: 'error', reason: TerminationReason.TOOL_OVERUSE, step, startedAt, extra: { error: msg } });
         }
@@ -932,6 +962,7 @@ export class AgentLoop {
 
       if (!result.ok && attempts > retryPolicy.retries) {
         this._consecutiveToolExhaustion += 1;
+        this._totalToolExhaustion += 1;
       } else {
         this._consecutiveToolExhaustion = 0;
       }
@@ -993,9 +1024,15 @@ export class AgentLoop {
         }
       }
 
-      // --- ERROR RECOVERY: give up only after repeated, consecutive exhaustion ---
-      if (this._consecutiveToolExhaustion >= this.maxConsecutiveToolExhaustion) {
-        const msg = `Tool "${action.tool}" exhausted retries ${this._consecutiveToolExhaustion} time(s) in a row - stopping instead of spinning on a broken tool.`;
+      // --- ERROR RECOVERY: give up after repeated consecutive exhaustion OR ---
+      // too many total exhaustion events (catches alternating broken tools).
+      const MAX_TOTAL_TOOL_EXHAUSTION = this.maxConsecutiveToolExhaustion * 3;
+      if (this._consecutiveToolExhaustion >= this.maxConsecutiveToolExhaustion
+          || this._totalToolExhaustion >= MAX_TOTAL_TOOL_EXHAUSTION) {
+        const isConsecutive = this._consecutiveToolExhaustion >= this.maxConsecutiveToolExhaustion;
+        const msg = isConsecutive
+          ? `Tool "${action.tool}" exhausted retries ${this._consecutiveToolExhaustion} time(s) in a row - stopping instead of spinning on a broken tool.`
+          : `${this._totalToolExhaustion} tool exhaustion events this run (limit ${MAX_TOTAL_TOOL_EXHAUSTION}) - multiple tools are failing repeatedly, stopping to prevent token waste.`;
         await this.context.append({ role: 'system', content: `[loop guard] ${msg}` });
         this._emit(LoopEvents.TOOL_FAILURE_EXHAUSTED, { step, tool: action.tool, error: msg });
         log.error('step:tool_failure_exhausted', { step, tool: action.tool, error: msg });
