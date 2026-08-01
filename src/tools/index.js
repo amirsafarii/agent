@@ -32,6 +32,8 @@ export { createShellTool, createShellSpawnTool, createShellKillTool, createShell
 export { createCodeTools } from './code.js';
 export { createPackageTools } from './package.js';
 export { createPlanningTools } from './planning.js';
+export { createTodoTools } from './todo.js';
+export { createSpecTools } from './spec.js';
 export { createVerificationTools } from './verification.js';
 export { createWebSearchTool } from './search.js';
 export { createHttpTools } from './http.js';

@@ -31,12 +31,17 @@ import {
   createCodeTools,
   createPackageTools,
   createPlanningTools,
+  createTodoTools,
+  createSpecTools,
   createVerificationTools,
   createWebSearchTool,
   createHttpTools,
 } from './tools/index.js';
+import { createPreflightTool } from './tools/todo.js';
 import { PlanningEngine } from './planning/index.js';
+import { Spec } from './planning/spec.js';
 import { VerificationEngine } from './verification/index.js';
+import { TodoManager } from './core/todo-manager.js';
 import { BudgetManager } from './budget/budget-manager.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory/integration.js';
@@ -48,62 +53,124 @@ const log = createLogger('index');
 
 const DEFAULT_SYSTEM_PROMPT = [
   'You are ScrappyAi, an autonomous coding/research agent built on a minimal, ',
-  'auditable core: a think -> act -> observe loop, a validated tool registry, ',
-  'a token-budgeted context window, and a persistent, layered memory system ',
-  '(session, long-term facts, semantic recall, past episodes).',
+  'auditable core: a think → act → observe loop, a validated tool registry, ',
+  'a token-budgeted context window, a persistent layered memory system ',
+  '(session / long-term / semantic / episodic), mandatory TODO + Spec ',
+  'planning, and a hard verification loop.',
   '',
-  'Operating rules:',
-  '- Use a tool when it materially helps (reading/writing files, running a ',
-  '  command, searching the web); answer directly otherwise. Never claim a ',
-  '  tool ran when it did not.',
-  '- Ask a clarifying question instead of guessing when the request is ',
-  '  genuinely ambiguous; do not stall on things you can reasonably infer.',
-  '- A "[memory]" system message, when present, lists facts you have ',
-  '  already confirmed about this user/project and relevant past turns or ',
-  '  episodes. Treat it as ground truth you already know - use it, do not ',
-  '  re-ask for it, and never contradict a confirmed fact without saying so.',
+  '══════════════════════════════════════════════════════════════',
+  'RULE ZERO — ANTI-LAZINESS (ENFORCED BY THE LOOP, NOT A SUGGESTION)',
+  '══════════════════════════════════════════════════════════════',
+  'The loop will REJECT any "final" answer if:',
+  '  1. TODO.md has un-ticked, unverified, or untested items, OR',
+  '  2. SPEC.md exists and has unimplemented/unverified files or failing tests, OR',
+  '  3. You have not actually run the work (no tool calls for multi-step tasks).',
+  'If your final answer is rejected you will be redirected back to the next',
+  'actionable task. Do not attempt to finish early — you will not get away with it.',
   '',
-  'Planning and Verification rules:',
-  '- For multi-step implementation tasks (e.g. creating web servers, multi-file apps), ',
-  '  use plan_create to define a clear step-by-step execution plan and update task ',
-  '  statuses as you progress.',
-  '- Always verify created files, server ports, or code syntax using verification ',
-  '  tools (verify_file, verify_command, verify_json, verify_suite) rather than ',
-  '  repeating shell execution calls.',
+  '══════════════════════════════════════════════════════════════',
+  'PHASE 1 — PLANNER (MANDATORY FIRST STEP FOR ANY NON-TRIVIAL TASK)',
+  '══════════════════════════════════════════════════════════════',
+  'A task is "non-trivial" if it needs more than ~2 tool calls, touches more',
+  'than one file, creates a feature/project, or modifies existing code.',
+  'BEFORE writing any code or running builds you MUST:',
   '',
-  'Node.js & Execution rules:',
-  '- Check package.json "type" field: if "type": "module" is present, JS files default ',
-  '  to ES Modules (use ESM import/export or .cjs extension for CommonJS require).',
-  '- Shell commands with pipes (|), redirection (>), or logical operators (&&, ||) ',
-  '  MUST set useShell: true.',
+  '  Step A. If multi-file / multi-component: call spec_create(...) with:',
+  '          - goal (1-paragraph restatement of the deliverable)',
+  '          - components (each logical piece)',
+  '          - files (COMPLETE list, in dependency order: src files, tests, config, README)',
+  '          - dataModel / api / dependencies / envVars / acceptance criteria',
+  '          This is the architect step. Think it through — do NOT skip files.',
   '',
-  'Efficiency and latency rules:',
-  '- Cheapest sufficient tool first. If a web_search snippet already contains ',
-  '  enough to answer, STOP there - do not call heavier tools (fetch/curl, ',
-  '  full file reads, package installs) for data you already have.',
-  '- Never call a tool twice for the same data, and never repeat a call whose ',
-  '  result you can see failed with the same arguments. Repeating identical or ',
-  '  near-identical calls is a bug, not persistence.',
-  '- Fallback Rule: when a tool fails with a network error, timeout, or any ',
-  '  transport-level failure (HTTP errors, DNS, connection refused), do NOT ',
-  '  retry that call and do NOT burn steps on it - pivot immediately: rely on ',
-  '  web_search results or answer from what you already know. Your step budget ',
-  '  is finite; each step must add new information.',
-  '- Limit total calls per tool: staying on one tool (endless search variants, ',
-  '  repeated installs) is misuse. Prefer the file tools for local data and the ',
-  '  web tools for remote data, and combine results instead of re-fetching.',
+  '  Step B. Call todo_create(...) with a concrete checklist of small steps.',
+  '          Items must be: 1-3 tool calls each, individually verifiable,',
+  '          ordered (implement → verify → test for each piece, not all at the end).',
+  '          Always include explicit verify/test items — never leave verification',
+  '          implicit. Every code-writing task must have a matching test item.',
   '',
-  'Toolset: file tools (read/write/edit/list/search/mkdir/move/copy/delete, all ',
-  'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
-  '(run/test/validate), package tools (npm/install/package_info), planning tools ',
-  '(plan_create/plan_update_task/plan_get/plan_add_tasks), verification tools ',
-  '(verify_file/verify_command/verify_json/verify_suite), web_search, and HTTP ',
-  'tools (http_get/http_post/http_request). Prefer apply_patch over a blind ',
-  'write_file for targeted edits — it validates hunks and applies atomically. ',
-  'Destructive actions (delete_file, shell_kill) wait for human approval.',
+  'For simple one-off questions (trivia, reading one file, a single shell command)',
+  'you may skip A but you should still use todo_create if more than one step is needed.',
   '',
-  'Be direct and concrete. State what you did and what remains; do not ',
-  '  narrate your own reasoning process or pad answers with filler.',
+  '══════════════════════════════════════════════════════════════',
+  'PHASE 2 — EXECUTOR (FILE-BY-FILE, IN ORDER)',
+  '══════════════════════════════════════════════════════════════',
+  'Follow the Spec and TODO in order. For each TODO item:',
+  '  1. todo_start(taskId) — mark you are working on it',
+  '  2. Do the work (write_file / edit_file / shell calls)',
+  '     - WRITE COMPLETE FILES. No "// TODO", "// implement me", "// rest of',
+  '       code", "...", "pass" (as a Python stub body), "throw new Error(',
+  '       \"not implemented\")", "your code here", or other placeholders.',
+  '     - If you write_file, you MUST include the FULL, WORKING content of',
+  '       the entire file. If you cannot fit it, either split the work into',
+  '       smaller spec items or use edit_file / apply_patch for targeted changes.',
+  '     - The write_file tool will auto-scan for placeholders and tell you if',
+  '       it detects incomplete code — fix it before moving on.',
+  '  3. Verify immediately (code_validate / verify_file / verify_command)',
+  '  4. Run relevant tests (code_test, npm test, or targeted test command)',
+  '  5. todo_tick(taskId, verified: true, testPassed: true)',
+  '     - Mark spec_file_verified for the corresponding spec entry.',
+  '',
+  'The Completeness Rules (VIOLATION = BUG, fix immediately):',
+  '  ✓ Every written file must parse (syntax-valid).',
+  '  ✓ Every function declared must have a real body (no stubs).',
+  '  ✓ Every module imported must exist or be added to dependencies.',
+  '  ✓ Every new feature must have at least one test or verification command.',
+  '  ✓ Config / env changes must be reflected in .env.example with comments.',
+  '  ✓ Deleting/commenting out failing tests is NOT a fix — fix the code.',
+  '',
+  '══════════════════════════════════════════════════════════════',
+  'GENERAL OPERATING RULES',
+  '══════════════════════════════════════════════════════════════',
+  '- Use a tool when it materially helps; answer directly otherwise. Never claim',
+  '  a tool ran when it did not.',
+  '- Ask a clarifying question instead of guessing when the request is genuinely',
+  '  ambiguous; do not stall on things you can reasonably infer.',
+  '- A "[memory]" system message, when present, is ground truth — use it, do not',
+  '  re-ask for it, never contradict a confirmed fact without saying so.',
+  '- A "[TODO gate]" or "[spec gate]" message means your previous final answer',
+  '  was REJECTED — read it, do the remaining work, and try again.',
+  '- A "[loop guard]" message means you repeated a call or used one tool too',
+  '  many times — pivot, do not retry the same thing.',
+  '',
+  '══════════════════════════════════════════════════════════════',
+  'EFFICIENCY & LATENCY',
+  '══════════════════════════════════════════════════════════════',
+  '- Cheapest sufficient tool first. A web_search snippet that answers the',
+  '  question is enough — do not call heavier tools for data you already have.',
+  '- Never call a tool twice for the same data; never repeat a failed call with',
+  '  identical arguments. Repeating is a bug, not persistence.',
+  '- Fallback Rule: network error / timeout / DNS / refused connection → do NOT',
+  '  retry that call. Pivot immediately: use prior data or web_search.',
+  '- Do not camp on one tool (endless search variants, repeated installs).',
+  '  Prefer file tools for local data, web tools for remote data.',
+  '- Prefer apply_patch over blind write_file for edits — it validates each hunk.',
+  '',
+  '══════════════════════════════════════════════════════════════',
+  'ENVIRONMENT / NODE',
+  '══════════════════════════════════════════════════════════════',
+  '- Check package.json "type": if "module" JS defaults to ESM (use import/export',
+  '  or .cjs for CommonJS require).',
+  '- Shell commands with |, >, &&, || MUST set useShell: true.',
+  '- Destructive actions (delete_file, shell_kill) wait for human approval.',
+  '',
+  '══════════════════════════════════════════════════════════════',
+  'TOOLSET',
+  '══════════════════════════════════════════════════════════════',
+  'Planning:   spec_create, spec_show, spec_next_files, spec_file_started,',
+  '            spec_file_done, spec_file_verified, spec_test_passed, spec_status',
+  'TODO:       todo_create, todo_add, todo_start, todo_tick, todo_mark_verified,',
+  '            todo_mark_tested, todo_untick, todo_skip, todo_status',
+  'Old plan:   plan_create, plan_update_task, plan_get, plan_add_tasks',
+  'Files:      read_file, write_file, edit_file, apply_patch, list_dir,',
+  '            search_files, make_dir, move_file, copy_file, delete_file',
+  'Shell:      shell, shell_spawn, shell_kill, shell_which',
+  'Code:       code_run, code_test, code_validate',
+  'Package:    npm, package_install, package_info',
+  'Verify:     verify_file, verify_command, verify_json, verify_suite, verify_preflight',
+  'Web/HTTP:   web_search, http_get, http_post, http_request',
+  '',
+  'Be direct. State what you did and what remains. Do not narrate your own',
+  'reasoning process or pad answers with filler. Finish what you start.',
 ].join('\n');
 
 /** Parse SCRAPPYAI_REQUIRE_APPROVAL ("tool1,tool2" or "*") into requireApprovalFor. */
@@ -113,6 +180,28 @@ function parseApprovalEnv() {
   const trimmed = raw.trim();
   if (trimmed === '*') return '*';
   return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Read a numeric env var with a hard default. Returns `defaultVal` if the
+ * var is unset, empty, or not a finite positive number — never NaN/undefined,
+ * so callers always get a real number.
+ */
+function readEnvInt(name, defaultVal) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultVal;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : defaultVal;
+}
+
+/** Read a boolean env var ("true"/"false"/"1"/"0") with a default. */
+function readEnvBool(name, defaultVal) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultVal;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes' || s === 'on') return true;
+  if (s === 'false' || s === '0' || s === 'no' || s === 'off' || s === '') return false;
+  return defaultVal;
 }
 
 /**
@@ -207,11 +296,35 @@ export function createDefaultToolRegistry(opts = {}) {
   // package suite (3 tools) — lifecycle scripts gated by sandbox level
   for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
 
-  // planning suite (4 tools)
+  // planning suite (4 tools — legacy plan_* tools)
   for (const def of createPlanningTools({ engine: opts.planningEngine })) registry.register(def);
+
+  // TODO checklist tools (9 tools) — only registered when a TodoManager is
+  // provided (buildAgent always passes one). Standalone uses of
+  // createDefaultToolRegistry({ registry }) without a manager keep the
+  // original minimal tool surface.
+  if (opts.todoManager) {
+    for (const def of createTodoTools({ manager: opts.todoManager, rootDir: filesRoot })) registry.register(def);
+  }
+
+  // Spec / PRD tools (Planner-Executor pattern) — same opt-in policy.
+  if (opts.spec) {
+    for (const def of createSpecTools({ spec: opts.spec, rootDir: filesRoot })) registry.register(def);
+  }
 
   // verification suite (4 tools)
   for (const def of createVerificationTools({ rootDir: filesRoot, engine: opts.verificationEngine })) registry.register(def);
+
+  // verify_preflight — automatic pre-final sweep (TODO + Spec + extra checks).
+  // Registered if a todoManager was provided (it is, by default, via buildAgent).
+  if (opts.todoManager) {
+    registry.register(createPreflightTool({
+      todoManager: opts.todoManager,
+      spec: opts.spec,
+      verificationEngine: opts.verificationEngine,
+      rootDir: filesRoot,
+    }));
+  }
 
   registry.register(createWebSearchTool());
 
@@ -251,16 +364,28 @@ export function createDefaultToolRegistry(opts = {}) {
 export function buildAgent(opts = {}) {
   const systemPrompt = loadSystemPrompt(opts.systemPrompt);
   const profileName = opts.profile || process.env.SCRAPPYAI_PERMISSION_PROFILE || 'developer';
+  const filesRoot = opts.filesRoot || process.env.SCRAPPYAI_FILES_ROOT || process.cwd();
+
+  // Anti-laziness managers (shared between the tool suite and the loop's
+  // FINAL gate). Callers can pass their own; otherwise we construct fresh
+  // ones per agent so each agent.run() session starts with a clean slate.
+  const todoManager = opts.todoManager || new TodoManager({ rootDir: filesRoot });
+  const spec = opts.spec || new Spec({ rootDir: filesRoot });
+  const verificationEngine = opts.verificationEngine || new VerificationEngine({ rootDir: filesRoot });
+  const planningEngine = opts.planningEngine || new PlanningEngine();
+
   const tools = opts.tools || createDefaultToolRegistry({
     profile: profileName,
-    filesRoot: opts.filesRoot,
-    planningEngine: opts.planningEngine,
-    verificationEngine: opts.verificationEngine,
+    filesRoot,
+    planningEngine,
+    verificationEngine,
+    todoManager,
+    spec,
   });
   const context =
     opts.context ||
     new ContextWindow({
-      maxTokens: Number(process.env.SCRAPPYAI_MAX_TOKENS) || 8000,
+      maxTokens: readEnvInt('SCRAPPYAI_MAX_TOKENS', 16000),
       systemPrompt,
     });
 
@@ -278,24 +403,26 @@ export function buildAgent(opts = {}) {
   const sessionId = opts.sessionId || process.env.SCRAPPYAI_SESSION_ID || `session_${Date.now()}_${randomUUID().slice(0, 8)}`;
 
   // Step budget: SCRAPPYAI_MAX_STEPS sets the base; SCRAPPYAI_ADAPTIVE_MAX_STEPS
-  // (default on) lets the loop grow the budget up to SCRAPPYAI_MAX_STEPS_MAX
+  // (default ON) lets the loop grow the budget up to SCRAPPYAI_MAX_STEPS_MAX
   // while the run keeps producing progress, so complex tasks aren't cut short
-  // by a fixed ceiling. maxToolCallsPerTool caps flailing on one tool.
-  const maxSteps = Number(process.env.SCRAPPYAI_MAX_STEPS) || 12;
-  const adaptiveEnabled = String(process.env.SCRAPPYAI_ADAPTIVE_MAX_STEPS).toLowerCase() !== 'false';
-  const adaptiveMax = Number(process.env.SCRAPPYAI_MAX_STEPS_MAX) || maxSteps * 4;
-  const maxToolCallsPerTool = Number(process.env.SCRAPPYAI_MAX_TOOL_CALLS_PER_TOOL) || 8;
+  // by a fixed ceiling — but infinite loops still hit a hard cap.
+  const maxSteps = readEnvInt('SCRAPPYAI_MAX_STEPS', 15);
+  const adaptiveEnabled = readEnvBool('SCRAPPYAI_ADAPTIVE_MAX_STEPS', true);
+  const adaptiveMax = readEnvInt('SCRAPPYAI_MAX_STEPS_MAX', 80);
+  const maxToolCallsPerTool = readEnvInt('SCRAPPYAI_MAX_TOOL_CALLS_PER_TOOL', 12);
+  const maxTaskTimeoutMs = readEnvInt('SCRAPPYAI_MAX_RUNTIME_MS', 600_000);
 
   // Independent BudgetManager (tokens/model/tool/network/subprocess/runtime/
-  // dollars) wired into the loop's stop-condition engine. All limits are
-  // optional; leave unset (no env) and the loop behaves exactly as before.
+  // dollars) wired into the loop's stop-condition engine. Every limit has a
+  // sane hard default so the agent cannot silently loop/spend forever.
   const budgetManager = opts.budgetManager
     || new BudgetManager({
-        maxModelCalls: Number(process.env.SCRAPPYAI_MAX_MODEL_CALLS) || undefined,
-        maxToolCalls: Number(process.env.SCRAPPYAI_MAX_TOOL_CALLS) || undefined,
-        maxNetworkCalls: Number(process.env.SCRAPPYAI_MAX_NETWORK_CALLS) || undefined,
-        maxRuntimeMs: Number(process.env.SCRAPPYAI_MAX_RUNTIME_MS) || undefined,
-        maxTokens: Number(process.env.SCRAPPYAI_BUDGET_TOKENS) || undefined,
+        maxModelCalls: readEnvInt('SCRAPPYAI_MAX_MODEL_CALLS', 60),
+        maxToolCalls: readEnvInt('SCRAPPYAI_MAX_TOOL_CALLS', 200),
+        maxNetworkCalls: readEnvInt('SCRAPPYAI_MAX_NETWORK_CALLS', 30),
+        maxSubprocesses: readEnvInt('SCRAPPYAI_MAX_SUBPROCESSES', 30),
+        maxRuntimeMs: maxTaskTimeoutMs,
+        maxTokens: readEnvInt('SCRAPPYAI_BUDGET_TOKENS', 200_000),
       });
 
   const agent = new AgentLoop({
@@ -312,10 +439,16 @@ export function buildAgent(opts = {}) {
     onPlanApproval: opts.onPlanApproval,
     lifecycleHooks: opts.lifecycleHooks,
     approvals: tools.approvals,
-    parallelConcurrency: opts.parallelConcurrency || Number(process.env.SCRAPPYAI_PARALLEL_CONCURRENCY) || 4,
+    parallelConcurrency: opts.parallelConcurrency || readEnvInt('SCRAPPYAI_PARALLEL_CONCURRENCY', 4),
+    maxTaskTimeoutMs,
     checkpointDir: opts.checkpointDir ?? (process.env.SCRAPPYAI_CHECKPOINT_DIR
       ? `${process.env.SCRAPPYAI_CHECKPOINT_DIR}/${sessionId}`
       : undefined),
+    // Anti-laziness gates:
+    todoManager,
+    specManager: spec,
+    verificationEngine,
+    strictFinal: opts.strictFinal !== false && String(process.env.SCRAPPYAI_STRICT_FINAL).toLowerCase() !== 'false',
   });
   // AgentLoop already exposes .context and .reasoner; stash the resolved
   // prompt too so the REPL's /system command can display it without
@@ -437,10 +570,15 @@ if (isMain) {
 
 export {
   createPlanningTools,
+  createTodoTools,
+  createSpecTools,
   createVerificationTools,
   PlanningEngine,
   VerificationEngine,
 };
+export { TodoManager } from './core/todo-manager.js';
+export { Spec } from './planning/spec.js';
+export { checkCompleteness, formatCompletenessResult } from './verification/completeness.js';
 
 export {
   resolveProfile,

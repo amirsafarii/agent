@@ -145,6 +145,10 @@ export class AgentLoop {
     goalState,
     artifactManager,
     eventBus,
+    todoManager,
+    specManager,
+    verificationEngine,
+    strictFinal = true, // when true, TODO gate + spec gate block FINAL until all work done
   } = {}) {
     if (!context) throw new LoopError('AgentLoop requires a ContextWindow instance ("context").');
     if (!tools) throw new LoopError('AgentLoop requires a ToolRegistry instance ("tools").');
@@ -183,6 +187,15 @@ export class AgentLoop {
     this.goalState = goalState || null;
     this.artifactManager = artifactManager || null;
     this.eventBus = eventBus || new EventBus();
+    // Anti-laziness gates:
+    //   - todoManager:       blocks FINAL until every TODO.md item is [x] + verified + tested
+    //   - specManager:       blocks FINAL until every file in SPEC.md is implemented + verified
+    //   - verificationEngine: used for the automatic pre-final verification sweep
+    //   - strictFinal:       master switch for both gates (default true)
+    this.todoManager = todoManager || null;
+    this.specManager = specManager || null;
+    this.verificationEngine = verificationEngine || null;
+    this.strictFinal = strictFinal !== false;
     /** @type {Run|null} current Run (separate from Task) */
     this.currentRun = null;
 
@@ -742,6 +755,28 @@ export class AgentLoop {
 
         // --- terminal actions --------------------------------------------
         if (action.type === ActionType.FINAL) {
+          // =============================================================
+          // ANTI-LAZINESS GATE: do NOT allow FINAL until TODO + Spec +
+          // pre-final verification all pass. When a gate fires we replace
+          // the FINAL with a redirecting system message and loop back to
+          // THINK so the reasoner can finish the actual work.
+          // =============================================================
+          if (this.strictFinal) {
+            const block = await this._checkFinalGate({ step, startedAt });
+            if (block) {
+              // Inject a system message telling the reasoner exactly what
+              // is still pending, then re-enter THINK instead of terminating.
+              await this.context.append({ role: 'system', content: block.message });
+              this._recordStep({ step, phase: 'final_blocked', action, error: block.reason, durationMs: 0 });
+              this._emit(LoopEvents.SIMILAR_CALL, { step, gate: block.reason, detail: block.message });
+              log.warn('run:final_blocked', { step, reason: block.reason, pending: block.pendingCount });
+              this._safeTransition(LoopState.THINKING);
+              // Consume the step budget for the rejected final (the
+              // reasoner already spent a think call); do not grow the
+              // adaptive budget because no progress was made.
+              continue;
+            }
+          }
           await this.context.addAssistant(action.content, { reasoning: action.reasoning });
           this._recordStep({ step, phase: 'final', action, durationMs: 0 });
           this._emit(LoopEvents.FINAL, { step, content: action.content });
@@ -1217,6 +1252,71 @@ export class AgentLoop {
     if (this.budgetManager) result.budget = this.budgetManager.toJSON();
 
     return result;
+  }
+
+  /**
+   * Run the anti-laziness gates before allowing a FINAL answer. Any gate
+   * firing returns a `{reason, message, pendingCount}` block; the caller
+   * injects `message` into context and re-enters THINK instead of
+   * terminating. Returns null only when all gates pass.
+   *
+   * Gates (in priority order):
+   *   1. TODO.md checklist     — every item completed + verified + tested
+   *   2. SPEC.md implementation — every file implemented + verified
+   * (Both are soft: if no TODO.md / SPEC.md exists yet we DO create a
+   * bootstrapping redirect so the first step of ANY non-trivial task is
+   * to write the plan — but only when there are zero items AND the user
+   * input was more than a couple of words. Simple factual Q&A is exempt.)
+   */
+  async _checkFinalGate(/* { step, startedAt } */) {
+    // Gate 1: TODO checklist.
+    // The gate only checks the IN-MEMORY todo list (populated by todo_create
+    // / todo_add during this session). A stale TODO.md from a prior session
+    // does NOT block a new run — the todo_create tool is the explicit signal
+    // that the agent has committed to a plan. This keeps simple Q&A turns
+    // working while still enforcing the gate for any task where the agent
+    // (or user/system prompt) asked for a plan.
+    if (this.todoManager && typeof this.todoManager.canFinish === 'function') {
+      try {
+        if (!this.todoManager.isEmpty()) {
+          const r = this.todoManager.canFinish();
+          if (!r.ok) {
+            return {
+              reason: 'todo_gate',
+              pendingCount: r.blockingCount,
+              message: r.message,
+            };
+          }
+        }
+      } catch (err) {
+        log.warn('final_gate:todo_check_failed', { error: err.message });
+      }
+    }
+
+    // Gate 2: Spec (PRD) completeness
+    if (this.specManager && typeof this.specManager.canFinish === 'function') {
+      try {
+        if (typeof this.specManager.load === 'function') {
+          await this.specManager.load().catch(() => {});
+        }
+        if (this.specManager.exists && this.specManager.exists()) {
+          const r = this.specManager.canFinish();
+          if (!r.ok) {
+            const lines = [
+              `[spec gate] Cannot finish yet: ${r.undoneFiles.length} file(s) unimplemented and ${r.undoneTests.length} test(s) not yet verified.`,
+              'Next files ready to implement:',
+              ...(r.nextFiles || []).slice(0, 5).map((f) => `  → [${f.id}] ${f.path}`),
+              'You must implement and verify each file before producing a final answer.',
+            ];
+            return { reason: 'spec_gate', pendingCount: r.undoneFiles.length + r.undoneTests.length, message: lines.join('\n') };
+          }
+        }
+      } catch (err) {
+        log.warn('final_gate:spec_check_failed', { error: err.message });
+      }
+    }
+
+    return null; // all gates pass — final is allowed
   }
 
   /**

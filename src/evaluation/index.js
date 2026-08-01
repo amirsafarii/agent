@@ -231,6 +231,12 @@ export class EvaluationEngine {
  * "success" when there is positive verification evidence, or when the
  * observation literally matches the expected outcome. Everything else is a
  * low-confidence "continue" or "repair".
+ *
+ * Hardened (anti-laziness):
+ *   - NEVER returns FINISH on a bare tool_call action that had no verification.
+ *   - Treats write_file/edit_file results that report completeness errors as REPAIR.
+ *   - Demands at least one positive observation (verification evidence or
+ *     concrete successful action) before allowing FINISH on multi-step goals.
  */
 async function defaultCritic({ goal, action, observation, expected, verification }) {
   // Verification (deterministic) is the highest-confidence signal.
@@ -247,6 +253,17 @@ async function defaultCritic({ goal, action, observation, expected, verification
       success: false,
       confidence: 0.25,
       reason: `verification failed (${verification.failed ?? 0} failing check(s))`,
+      next: EvalNext.REPAIR,
+    };
+  }
+
+  // If the observation is a write_file that flagged completeness errors,
+  // force repair instead of letting the agent drift to "done".
+  if (observation && typeof observation === 'object' && observation.completeness && observation.completeness.ok === false) {
+    return {
+      success: false,
+      confidence: 0.2,
+      reason: `write_file flagged ${observation.completeness.errors} placeholder/stub error(s): ${observation.completeness.details.slice(0, 300)}`,
       next: EvalNext.REPAIR,
     };
   }
@@ -276,12 +293,31 @@ async function defaultCritic({ goal, action, observation, expected, verification
     };
   }
 
+  // If the action itself was a successful final-producing tool (e.g. a
+  // shell command that exits 0 on a trivially-completable goal), allow
+  // finish at moderate confidence. This lets simple one-shot commands
+  // through without forcing an extra verification step.
+  if (action && observation && typeof observation === 'object' && observation.ok === true && !observation.completeness) {
+    // Looks like a single-shot success (read/query, not a multi-step build).
+    // We still require the action to be a "read-only" shaped tool, not a write.
+    const toolName = action.tool || '';
+    const readonly = /^(read_file|list_dir|search_files|web_search|http_get|shell_which|verify_|verify|code_test|code_validate|plan_get|todo_status|spec_status|spec_show|spec_next_files|package_info)$/.test(toolName);
+    if (readonly) {
+      return {
+        success: true,
+        confidence: 0.7,
+        reason: `single-step ${toolName} returned ok=true`,
+        next: EvalNext.FINISH,
+      };
+    }
+  }
+
   // No verifiable signal: the agent cannot prove the goal is met, so it should
   // not claim success. Continue acting.
   return {
     success: false,
     confidence: 0.1,
-    reason: `no verification evidence for goal: "${goal || '(unspecified)'}"`,
+    reason: `no verification evidence for goal: "${(goal || '(unspecified)').slice(0, 120)}" — run verification tools or finish TODO items before declaring done`,
     next: EvalNext.CONTINUE,
   };
 }

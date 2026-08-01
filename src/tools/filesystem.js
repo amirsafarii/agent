@@ -26,6 +26,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createLogger } from '../core/logger.js';
 import { createSandbox } from '../security/sandbox.js';
+import { checkCompleteness, formatCompletenessResult } from '../verification/completeness.js';
 
 const log = createLogger('tools:filesystem');
 
@@ -140,8 +141,34 @@ export function createFilesystemTools(opts = {}) {
         log.error('write_file:failed', { path: args.path, error: err.message, code: err.code });
         throw fileError(`Failed to write "${args.path}": ${err.message}`, err.code || 'WRITE_ERROR');
       }
-      const output = { path: args.path, bytesWritten: Buffer.byteLength(args.content, 'utf8'), appended: !!args.append };
-      log.info('write_file:done', output);
+      // Anti-half-baked-code scan: on non-append writes of source-code-like
+      // extensions, run the completeness detector so placeholders / stubs /
+      // truncated code are caught BEFORE the agent ticks the TODO item.
+      let completeness = null;
+      if (!args.append) {
+        const ext = (args.path.split('.').pop() || '').toLowerCase();
+        const codeExts = new Set(['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'sh', 'bash', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'hpp', 'rb', 'php']);
+        if (codeExts.has(ext)) {
+          const res = checkCompleteness(args.content, args.path);
+          completeness = {
+            ok: res.ok,
+            errors: res.errors.length,
+            warnings: res.warnings.length,
+            details: formatCompletenessResult(res, args.path),
+          };
+          if (!res.ok) {
+            log.warn('write_file:completeness_failed', { path: args.path, errors: res.errors.length });
+          }
+        }
+      }
+
+      const output = {
+        path: args.path,
+        bytesWritten: Buffer.byteLength(args.content, 'utf8'),
+        appended: !!args.append,
+        ...(completeness ? { completeness } : {}),
+      };
+      log.info('write_file:done', { path: args.path, bytesWritten: output.bytesWritten, completenessOk: completeness?.ok ?? 'n/a' });
       return output;
     },
   };
