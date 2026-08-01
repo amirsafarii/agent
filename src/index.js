@@ -27,6 +27,10 @@ import { createFileTools } from './tools/files.js';
 import { createWebSearchTool } from './tools/search.js';
 import { createCodeTools } from './tools/code.js';
 import { createPackageTools } from './tools/package.js';
+import { createPlanningTools } from './tools/planning.js';
+import { createVerificationTools } from './tools/verification.js';
+import { PlanningEngine } from './planning.js';
+import { VerificationEngine } from './verification.js';
 import { runRepl } from './repl.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory-integration.js';
@@ -70,10 +74,12 @@ const DEFAULT_SYSTEM_PROMPT = [
   '  repeated installs) is misuse. Prefer the file tools for local data and the ',
   '  web tools for remote data, and combine results instead of re-fetching.',
   '',
-  'Toolset: file tools (read/write/edit/list/search/mkdir/move/copy/delete, all ',
-  'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
-  '(run/test/validate), package tools (npm/install/package_info), and web_search. ',
-  'Destructive actions (delete_file, shell_kill) wait for human approval.',
+'Toolset: file tools (read/write/edit/list/search/mkdir/move/copy/delete, all ',
+'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
+'(run/test/validate), package tools (npm/install/package_info), planning tools ',
+'(plan_create/plan_update_task/plan_get/plan_add_tasks), verification tools ',
+'(verify_file/verify_command/verify_json/verify_suite), and web_search. ',
+'Destructive actions (delete_file, shell_kill) wait for human approval.',
   '',
   'Be direct and concrete. State what you did and what remains; do not ',
   '  narrate your own reasoning process or pad answers with filler.',
@@ -155,6 +161,12 @@ export function createDefaultToolRegistry(opts = {}) {
 
   // package suite (3 tools)
   for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
+
+  // planning suite (4 tools)
+  for (const def of createPlanningTools({ engine: opts.planningEngine })) registry.register(def);
+
+  // verification suite (4 tools)
+  for (const def of createVerificationTools({ rootDir: filesRoot, engine: opts.verificationEngine })) registry.register(def);
 
   registry.register(createWebSearchTool());
 
@@ -344,5 +356,12 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(pro
 if (isMain) {
   main();
 }
+
+export {
+  createPlanningTools,
+  createVerificationTools,
+  PlanningEngine,
+  VerificationEngine,
+};
 
 export default buildAgent;

@@ -11,6 +11,8 @@ src/
 ├── context.js              ← context window: token budget + auto-compaction (ContextWindow)
 ├── reasoner.js             ← pluggable LLM adapter + native tool_call_id history,
 │                              + streaming (createReasoner)
+├── planning.js             ← multi-step execution plans and subtask tracking (PlanningEngine)
+├── verification.js         ← file/command/JSON/suite validation checks (VerificationEngine)
 ├── checkpoint-manager.js   ← every checkpoint addressable by id, in memory + on disk
 ├── session-logger.js       ← per-session events.jsonl + transcript.log on disk
 ├── trace.js                ← Claude-Code-style colored terminal trace + scratchpad renderer
@@ -20,7 +22,7 @@ src/
 ├── index.js                ← buildAgent() wiring: tools + 9router + memory + session log
 ├── memory-integration.js   ← [memory] injection before each turn, recording after
 ├── clients/9router.js      ← OpenAI-compatible chat + chatStream (SSE) adapter
-├── tools/{shell,files,search}.js
+├── tools/{shell,files,search,code,package,planning,verification}.js
 └── memory/                 ← seven-layer memory (session/workspace/episodic/semantic/
                                long-term/tool/project), in-process or Redis
 tests/
@@ -32,6 +34,8 @@ tests/
 │                              SessionLogger
 ├── 9router.test.js         ← stream:false, NDJSON/SSE recovery, HTTP errors, mapping
 ├── tools.test.js           ← ToolRegistry + real shell/files behavior + stubbed search
+├── planning.test.js        ← PlanningEngine + task progress & subtask tool suite
+├── verification.test.js    ← VerificationEngine + file/command/JSON/suite test runner
 ├── memory.test.js          ← all seven layers + extractor + wireMemory degrade
 ├── streaming.test.js       ← chatStream SSE accumulation + streamed AgentLoop turns
 ├── logger.test.js          ← redaction + clipping
@@ -43,7 +47,7 @@ tests/
 ```
 npm test
 ```
-(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **140 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
+(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **148 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
 
 ## Wiring it together
 
@@ -139,7 +143,7 @@ on `src/clients/9router.js` into one `AgentLoop`, and runs a single prompt from 
 `buildAgent()` / `createDefaultToolRegistry()` instead if you want to embed ScrappyAi in another
 program (e.g. a Slack bot, a CLI with a REPL, a server).
 
-## Tools registered by default (`src/tools/`) — 20 tools in 5 suites
+## Tools registered by default (`src/tools/`) — 28 tools in 7 suites
 
 **filesystem** (`tools/filesystem.js`) — all confined to the sandbox root
 (`SCRAPPYAI_FILES_ROOT`, default cwd); `../` traversal and absolute paths
@@ -181,6 +185,24 @@ outside the root are rejected before any fs call:
 | `npm` | Any npm command inside the sandbox (`run build`, `ls`, ...), 120s timeout. |
 | `package_install` | `npm install` / `npm install <pkgs>` with `dev`/`force` flags. |
 | `package_info` | Offline metadata: the project's package.json or an installed package resolved from cwd (no registry call). |
+
+**planning** (`tools/planning.js`):
+
+| Tool | Notes |
+|---|---|
+| `plan_create` | Create a structured multi-step task execution plan with subtasks and dependency tracking. |
+| `plan_update_task` | Update task status (`pending`, `in_progress`, `completed`, `failed`, `skipped`) or notes. |
+| `plan_get` | Inspect current plan status, completion percentage, and next ready actionable tasks. |
+| `plan_add_tasks` | Append new subtasks dynamically to an active plan as needs evolve. |
+
+**verification** (`tools/verification.js`):
+
+| Tool | Notes |
+|---|---|
+| `verify_file` | Assert file or directory existence, size, or required content/regex pattern. |
+| `verify_command` | Assert command exit code and expected stdout/stderr output. |
+| `verify_json` | Assert valid JSON syntax and verify required top-level keys. |
+| `verify_suite` | Execute a batch suite of file, command, or JSON verification checks in sequence. |
 
 **web**: `web_search` (`tools/search.js`) — SearXNG JSON API (`SEARXNG_BASE_URL`), all documented params, results capped (default 8).
 

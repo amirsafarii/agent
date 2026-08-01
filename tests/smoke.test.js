@@ -33,7 +33,7 @@ test.after(() => {
   global.fetch = originalFetch;
 });
 
-test('buildAgent: wires the full stack with the 20 default tools and memory', () => {
+test('buildAgent: wires the full stack with default tools and memory', () => {
   global.fetch = async () =>
     new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }), { status: 200 });
 
@@ -55,12 +55,20 @@ test('buildAgent: wires the full stack with the 20 default tools and memory', ()
     'npm',
     'package_info',
     'package_install',
+    'plan_add_tasks',
+    'plan_create',
+    'plan_get',
+    'plan_update_task',
     'read_file',
     'search_files',
     'shell',
     'shell_kill',
     'shell_spawn',
     'shell_which',
+    'verify_command',
+    'verify_file',
+    'verify_json',
+    'verify_suite',
     'web_search',
     'write_file',
   ]);
@@ -162,11 +170,12 @@ test('createDefaultToolRegistry: registers into an existing registry too', () =>
   const registry = new ToolRegistry();
   const out = createDefaultToolRegistry({ registry });
   assert.equal(out, registry);
-  assert.equal(registry.list().length, 20);
+  assert.equal(registry.list().length, 28);
   const names = registry.list().map((t) => t.name);
   for (const expected of ['edit_file', 'list_dir', 'search_files', 'make_dir', 'move_file', 'copy_file', 'delete_file',
     'shell_spawn', 'shell_kill', 'shell_which', 'code_run', 'code_test', 'code_validate',
-    'npm', 'package_install', 'package_info', 'read_file', 'write_file', 'shell', 'web_search']) {
+    'npm', 'package_install', 'package_info', 'plan_create', 'plan_update_task', 'plan_get', 'plan_add_tasks',
+    'verify_file', 'verify_command', 'verify_json', 'verify_suite', 'read_file', 'write_file', 'shell', 'web_search']) {
     assert.ok(names.includes(expected), `tool ${expected} registered`);
   }
 });

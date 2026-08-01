@@ -724,8 +724,8 @@ reasoner هشدار می‌دهد که داده را دارد و تکرار نک
 
 ## 24. شمارش نهایی تست‌ها
 
-همه‌ی فایل‌های تست با هم: **۱۴۰/۱۴۰ تست سبز** — ۹ تست `loop-advanced`، ۸ تست `loop-checkpoint`،
-۱۰ تست `loop-approval`، ۱۵ تست `reasoner` (شامل sync حافظه و non-duplication پرامپت)، ۱۰ تست `9router`، ۱۳ تست `tools`، ۸ تست `loop-guards`
+همه‌ی فایل‌های تست با هم: **۱۴۸/۱۴۸ تست سبز** — ۹ تست `loop-advanced`، ۸ تست `loop-checkpoint`،
+۱۰ تست `loop-approval`، ۱۵ تست `reasoner` (شامل sync حافظه و non-duplication پرامپت)، ۱۰ تست `9router`، ۱۳ تست `tools`، ۳ تست `planning` (موتور برنامه و ابزارهای plan_create/update/get/add_tasks)، ۵ تست `verification` (موتور تایید و ابزارهای verify_file/command/json/suite)، ۸ تست `loop-guards`
 (بودجه‌ی تطبیقی، overuse، similar-call)، ۹ تست `filesystem`، ۶ تست `shell-extra`، ۹ تست
 `code-package`، ۱۴ تست `memory` (شامل fallback محلی و fix حافظه بین turn)، ۱۰ تست `streaming`،
 ۶ تست `logger`، ۸ تست `smoke` و ۵ تست `repl`. بدون شکستن هیچ‌کدام.
