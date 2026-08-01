@@ -33,9 +33,11 @@ import {
   createPlanningTools,
   createVerificationTools,
   createWebSearchTool,
+  createHttpTools,
 } from './tools/index.js';
 import { PlanningEngine } from './planning/index.js';
 import { VerificationEngine } from './verification/index.js';
+import { BudgetManager } from './budget/budget-manager.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory/integration.js';
 import { resolveProfile, ApprovalManager } from './security/permissions.js';
@@ -95,7 +97,9 @@ const DEFAULT_SYSTEM_PROMPT = [
   'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
   '(run/test/validate), package tools (npm/install/package_info), planning tools ',
   '(plan_create/plan_update_task/plan_get/plan_add_tasks), verification tools ',
-  '(verify_file/verify_command/verify_json/verify_suite), and web_search. ',
+  '(verify_file/verify_command/verify_json/verify_suite), web_search, and HTTP ',
+  'tools (http_get/http_post/http_request). Prefer apply_patch over a blind ',
+  'write_file for targeted edits — it validates hunks and applies atomically. ',
   'Destructive actions (delete_file, shell_kill) wait for human approval.',
   '',
   'Be direct and concrete. State what you did and what remains; do not ',
@@ -211,6 +215,16 @@ export function createDefaultToolRegistry(opts = {}) {
 
   registry.register(createWebSearchTool());
 
+  // HTTP / network suite (http_get, http_post, http_request) — bounded by
+  // timeout, max response size, and an allowed-domains allowlist when given.
+  for (const def of createHttpTools({
+    timeoutMs: opts.httpTimeoutMs ?? (Number(process.env.SCRAPPYAI_HTTP_TIMEOUT_MS) || undefined),
+    maxResponseSize: opts.httpMaxResponseSize ?? (Number(process.env.SCRAPPYAI_HTTP_MAX_RESPONSE_SIZE) || undefined),
+    allowedDomains: opts.httpAllowedDomains ?? (process.env.SCRAPPYAI_HTTP_ALLOWED_DOMAINS
+      ? process.env.SCRAPPYAI_HTTP_ALLOWED_DOMAINS.split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined),
+  })) registry.register(def);
+
   return registry;
 }
 
@@ -272,6 +286,18 @@ export function buildAgent(opts = {}) {
   const adaptiveMax = Number(process.env.SCRAPPYAI_MAX_STEPS_MAX) || maxSteps * 4;
   const maxToolCallsPerTool = Number(process.env.SCRAPPYAI_MAX_TOOL_CALLS_PER_TOOL) || 8;
 
+  // Independent BudgetManager (tokens/model/tool/network/subprocess/runtime/
+  // dollars) wired into the loop's stop-condition engine. All limits are
+  // optional; leave unset (no env) and the loop behaves exactly as before.
+  const budgetManager = opts.budgetManager
+    || new BudgetManager({
+        maxModelCalls: Number(process.env.SCRAPPYAI_MAX_MODEL_CALLS) || undefined,
+        maxToolCalls: Number(process.env.SCRAPPYAI_MAX_TOOL_CALLS) || undefined,
+        maxNetworkCalls: Number(process.env.SCRAPPYAI_MAX_NETWORK_CALLS) || undefined,
+        maxRuntimeMs: Number(process.env.SCRAPPYAI_MAX_RUNTIME_MS) || undefined,
+        maxTokens: Number(process.env.SCRAPPYAI_BUDGET_TOKENS) || undefined,
+      });
+
   const agent = new AgentLoop({
     context,
     tools,
@@ -279,6 +305,7 @@ export function buildAgent(opts = {}) {
     maxSteps,
     adaptiveMaxSteps: adaptiveEnabled ? { max: adaptiveMax, growthFactor: 2 } : false,
     maxToolCallsPerTool,
+    budgetManager,
     onEvent: opts.onEvent,
     requireApprovalFor: opts.requireApprovalFor ?? parseApprovalEnv(),
     onToolApproval: opts.onToolApproval,
@@ -440,5 +467,17 @@ export {
   ToolRegistry,
   ToolError,
 } from './tools/index.js';
+export { createHttpTools } from './tools/index.js';
+
+// Evaluation / Critic layer + Goal completion detector + Evidence (provenance)
+export {
+  EvaluationEngine,
+  GoalState,
+  EvalNext,
+  evidenceOf,
+  sha256,
+} from './evaluation/index.js';
+export { BudgetManager, BudgetUnits } from './budget/budget-manager.js';
+export { ArtifactManager, ArtifactType } from './artifacts/artifact-manager.js';
 
 export default buildAgent;

@@ -35,14 +35,17 @@ export class LongTermMemory {
     this.store = new PulseStore({ redisConnection, namespace: 'mem:longterm', defaultTtl: 0, persist: true });
   }
 
-  async create({ userId, key, value, tags = [], importance = 0.7, confidence, source, turnId, confirmedByUser }) {
+  async create({ userId, key, value, tags = [], importance = 0.7, confidence, source, turnId, confirmedByUser, scope, sessionId, evidence }) {
     const conf = clampConfidence(confidence);
     const src = normalizeSource(source);
     const confirmed = confirmedByUser ?? (src === 'explicit');
+    const sc = scope || 'user';
     return this.store.store({
       type: 'fact', userId, key, value, tags, importance, persist: true,
       confidence: conf, source: src, confirmedByUser: confirmed, requiresConfirmation: false,
-      versions: [{ value, setAt: new Date().toISOString(), setBy: src, confidence: conf, turnId: turnId ?? null }],
+      scope: sc,
+      evidence: evidence || { sessionId: sessionId ?? null, turnId: turnId ?? null },
+      versions: [{ value, setAt: new Date().toISOString(), setBy: src, confidence: conf, turnId: turnId ?? null, scope: sc }],
     });
   }
 
@@ -60,16 +63,17 @@ export class LongTermMemory {
    * rather than overwriting `current` — a stray guess from the model can
    * no longer silently replace something the user actually said.
    */
-  async upsertByKey({ userId, key, value, tags = [], importance = 0.7, confidence, source, turnId, confirmedByUser }) {
+  async upsertByKey({ userId, key, value, tags = [], importance = 0.7, confidence, source, turnId, confirmedByUser, scope, sessionId, evidence }) {
     const conf = clampConfidence(confidence);
     const src = normalizeSource(source);
     const confirmed = confirmedByUser ?? (src === 'explicit');
+    const sc = scope || 'user';
 
-    if (!key) return this.create({ userId, key, value, tags, importance, confidence: conf, source: src, turnId, confirmedByUser: confirmed });
+    if (!key) return this.create({ userId, key, value, tags, importance, confidence: conf, source: src, turnId, confirmedByUser: confirmed, scope: sc, sessionId, evidence });
 
     const existing = await this.store.search({ userId, type: 'fact', limit: 500 });
     const match = existing.find(item => item.key === key);
-    if (!match) return this.create({ userId, key, value, tags, importance, confidence: conf, source: src, turnId, confirmedByUser: confirmed });
+    if (!match) return this.create({ userId, key, value, tags, importance, confidence: conf, source: src, turnId, confirmedByUser: confirmed, scope: sc, sessionId, evidence });
 
     const existingConfirmed = match.confirmedByUser === true;
     const incomingIsWeaker = src !== 'explicit' && conf <= (match.confidence ?? 0.7);
@@ -84,16 +88,27 @@ export class LongTermMemory {
         pendingSource: src,
         pendingConfidence: conf,
         pendingTurnId: turnId ?? null,
+        pendingScope: sc,
       });
       return match.id;
     }
 
-    const versions = [...(match.versions ?? []), { value, setAt: new Date().toISOString(), setBy: src, confidence: conf, turnId: turnId ?? null }].slice(-20);
+    // Explicit supersession: record what this new value replaces (previous
+    // version + value) so "Ilam → Tehran" keeps the old value visible and the
+    // new one is unambiguously the current one. Full history stays in versions.
+    const supersedes = {
+      version: (match.versions?.length ?? 0) + 1,
+      value: match.value,
+      setAt: match.updatedAt ?? match.createdAt ?? new Date().toISOString(),
+    };
+    const versions = [...(match.versions ?? []), { value, setAt: new Date().toISOString(), setBy: src, confidence: conf, turnId: turnId ?? null, scope: sc }].slice(-20);
     await this.store.update(match.id, {
-      value, tags, importance, versions,
+      value, tags, importance, versions, supersedes,
+      scope: sc,
       confidence: conf, source: src,
+      evidence: evidence || { sessionId: sessionId ?? null, turnId: turnId ?? null },
       confirmedByUser: confirmed || match.confirmedByUser === true,
-      requiresConfirmation: false, pendingValue: undefined, pendingSource: undefined, pendingConfidence: undefined,
+      requiresConfirmation: false, pendingValue: undefined, pendingSource: undefined, pendingConfidence: undefined, pendingScope: undefined,
     });
     return match.id;
   }

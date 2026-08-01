@@ -202,6 +202,10 @@ export class VerificationEngine {
         check: 'command_exit',
         command,
         exitCode: actualExit,
+        // Keep the output on success too — it is the provenance behind a
+        // claim like "npm test → 152 passed". Sliced to bound size.
+        stdout: proc.stdout.slice(0, 1000),
+        stderr: proc.stderr.slice(0, 1000),
         durationMs,
       };
     } catch (err) {
@@ -317,7 +321,10 @@ export class VerificationEngine {
         res = { ok: false, check: check.type || 'unknown', error: `Unrecognized check type or parameters.` };
       }
 
-      results.push(res);
+      // Attach provenance: which check, on what, produced this verdict. The
+      // evidence list is the audit trail behind every claim the agent makes
+      // from this suite ("npm test → 152 passed").
+      results.push(attachEvidence(res));
       if (res.ok) {
         passed++;
       } else {
@@ -337,6 +344,28 @@ export class VerificationEngine {
       results,
     };
   }
+}
+
+/**
+ * Build a compact provenance record from a check result:
+ *   {check, path, command, output, exitCode}
+ * This is the `evidence` an EvaluationEngine / GoalState uses to back a claim.
+ */
+function attachEvidence(res) {
+  const evidence = { check: res.check };
+  if (res.path) evidence.path = res.path;
+  if (res.command) {
+    evidence.type = 'command';
+    evidence.command = res.command;
+    if (res.exitCode !== undefined) evidence.exitCode = res.exitCode;
+    evidence.output = (res.stdout ?? '') + (res.stderr ?? '');
+  } else if (res.path) {
+    evidence.type = 'file';
+  } else {
+    evidence.type = 'json';
+  }
+  if (res.ok !== undefined) evidence.ok = res.ok;
+  return { ...res, evidence };
 }
 
 /** Default global verification engine instance */

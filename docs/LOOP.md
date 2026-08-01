@@ -80,6 +80,7 @@ type LoopResult = {
 | `invalid_action` | reasoner یک Action نامعتبر برگرداند (schema mismatch) | `_validateAction()` |
 | `paused_by_request` | یک‌جا فراخوانی `loop.pause()` شد | condition `pause_requested` در Stop Condition Engine |
 | `awaiting_tool_approval` | یک tool_call به تایید نیاز داشت و هیچ `onToolApproval` hook‌ای برای تصمیم خودکار وجود نداشت | دروازه‌ی Tool Approval، قبل از فاز ACT — بخش ۱۵ |
+| `budget_exceeded` | یک سقف از `BudgetManager` (tokens/model/tool/network/runtime/…) رد شد | stop condition `budget` (فقط وقتی `budgetManager` تزریق شود) |
 
 ---
 
@@ -93,6 +94,45 @@ type Action =
   | { type: 'final'; content: string; reasoning?: string }
   | { type: 'need_clarification'; question: string; reasoning?: string };
 ```
+
+---
+
+## 3.1. Evaluation / Critic stage (اختیاری)
+
+وقتی `new AgentLoop({ evaluator })` با یک `EvaluationEngine` ساخته شود، بعد از هر
+فاز OBSERVE یک فاز EVALUATE اضافه می‌شود:
+
+```
+think → act → observe → evaluate → continue / repair / finish
+```
+
+- خروجی `evaluator.evaluate({goal, action, observation, verification})` شکل
+  `{success, confidence, reason, next}` دارد که `next ∈ continue|repair|finish`.
+- رویداد `evaluate` (LoopEvents.EVALUATE) با همین verdict منتشر می‌شود و در
+  step memory با `phase: 'evaluate'` ثبت می‌شود.
+- اگر `next === 'repair'`، یک پیام سیستم `[evaluation] …` به context اضافه می‌شود
+  تا reasoner در فکر بعدی، تعمیر کند به‌جای اینکه با confidence پایین «final» بدهد.
+- معیار default (بدون `critic` سفارشی) هرگز موفقیت را حدس نمی‌زند: فقط وقتی
+  success/confidence بالا برمی‌گرداند که یک نتیجه‌ی verification (deterministic)
+  یا تطابق observation با `expected` وجود داشته باشد.
+
+### Goal completion detector + Evidence
+
+- `GoalState({goal, requirements})` — هر requirement با `evidence` (پرووننس)
+  و پرچم satisfied/unsatisfied. قبل از «final» می‌توان ثابت کرد که goal ارضا شده
+  است. وقتی `new AgentLoop({ goalState })` داده شود، خروجی نهایی `run()` یک فیلد
+  `goal` (خلاصه‌ی GoalState) می‌گیرد.
+- `evidenceOf(claim, [{type, command, output}])` — ساختار پرووننس برای هر ادعا.
+- در خروجی نهایی، اگر `artifactManager` و `budgetManager` تزریق شده باشند، فیلدهای
+  `artifacts`/`artifactStats` و `budget` هم به LoopResult اضافه می‌شوند.
+
+### BudgetManager
+
+- `new AgentLoop({ budgetManager })` → یک stop condition `budget` ثبت می‌شود که
+  به محض رد شدن هر سقف (token/model/tool/network/subprocess/runtime/dollars)
+  run را با `reason: budget_exceeded` تمام می‌کند.
+- هر `BudgetManager` یک شمارنده‌ی usage مشترک دارد؛ `scope(taskId)` یک child با
+  سقفِ «باقی‌مانده‌ی والد» می‌سازد (هیچ child نمی‌تواند بیش از آنچه والد دارد خرج کند).
 
 قوانین validation (`_validateAction`، در `core/loop/agent-loop.js`):
 

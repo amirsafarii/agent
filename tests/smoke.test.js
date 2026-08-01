@@ -43,12 +43,16 @@ test('buildAgent: wires the full stack with default tools and memory', () => {
   assert.ok(agent.tools instanceof ToolRegistry);
   const toolNames = agent.tools.list().map((t) => t.name).sort();
   assert.deepEqual(toolNames, [
+    'apply_patch',
     'code_run',
     'code_test',
     'code_validate',
     'copy_file',
     'delete_file',
     'edit_file',
+    'http_get',
+    'http_post',
+    'http_request',
     'list_dir',
     'make_dir',
     'move_file',
@@ -170,12 +174,13 @@ test('createDefaultToolRegistry: registers into an existing registry too', () =>
   const registry = new ToolRegistry();
   const out = createDefaultToolRegistry({ registry });
   assert.equal(out, registry);
-  assert.equal(registry.list().length, 28);
+  assert.equal(registry.list().length, 32);
   const names = registry.list().map((t) => t.name);
   for (const expected of ['edit_file', 'list_dir', 'search_files', 'make_dir', 'move_file', 'copy_file', 'delete_file',
     'shell_spawn', 'shell_kill', 'shell_which', 'code_run', 'code_test', 'code_validate',
     'npm', 'package_install', 'package_info', 'plan_create', 'plan_update_task', 'plan_get', 'plan_add_tasks',
-    'verify_file', 'verify_command', 'verify_json', 'verify_suite', 'read_file', 'write_file', 'shell', 'web_search']) {
+    'verify_file', 'verify_command', 'verify_json', 'verify_suite', 'read_file', 'write_file', 'shell', 'web_search',
+    'apply_patch', 'http_get', 'http_post', 'http_request']) {
     assert.ok(names.includes(expected), `tool ${expected} registered`);
   }
 });

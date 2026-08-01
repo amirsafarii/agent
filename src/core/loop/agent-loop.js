@@ -136,6 +136,10 @@ export class AgentLoop {
     approvals,
     parallelConcurrency = 4,
     onEvent,
+    evaluator,
+    budgetManager,
+    goalState,
+    artifactManager,
   } = {}) {
     if (!context) throw new LoopError('AgentLoop requires a ContextWindow instance ("context").');
     if (!tools) throw new LoopError('AgentLoop requires a ToolRegistry instance ("tools").');
@@ -165,6 +169,13 @@ export class AgentLoop {
     this.approvals = approvals || (tools && tools.approvals) || new ApprovalManager();
     this.parallelConcurrency = Number.isFinite(parallelConcurrency) ? parallelConcurrency : 4;
     this.onEvent = onEvent || (() => {});
+    // Optional Evaluation / Critic layer, BudgetManager, Goal completion
+    // detector, and Artifact ledger. When provided they steer + audit the run;
+    // when absent the loop behaves exactly as before (backward compatible).
+    this.evaluator = evaluator || null;
+    this.budgetManager = budgetManager || null;
+    this.goalState = goalState || null;
+    this.artifactManager = artifactManager || null;
     /** @type {Run|null} current Run (separate from Task) */
     this.currentRun = null;
 
@@ -241,6 +252,26 @@ export class AgentLoop {
       },
       { priority: 20 }
     );
+    // Independent BudgetManager (tokens/model/tool/network/subprocess/runtime/
+    // dollars) — stops the run as soon as ANY configured limit is exceeded.
+    // Only registered when a budgetManager is actually provided, so a loop
+    // without one has the exact same stop-engine surface as before.
+    if (this.budgetManager) {
+      this.stopEngine.register(
+        'budget',
+        () => {
+          if (!this.budgetManager) return null;
+          const reason = this.budgetManager.reason();
+          if (!reason) return null;
+          return {
+            reason: TerminationReason.BUDGET_EXCEEDED,
+            status: 'error',
+            message: reason,
+          };
+        },
+        { priority: 15 }
+      );
+    }
     (Array.isArray(stopConditions) ? stopConditions : []).forEach((fn, i) => {
       this.stopEngine.register(fn.name || `custom_stop_${i}`, wrapLegacyStopCondition(fn), { priority: 100 + i });
     });
@@ -665,6 +696,8 @@ export class AgentLoop {
           // End-to-end cancellation: signal reaches the reasoner → HTTP client.
           action = await this.reasoner(rendered, toolSchema, { signal });
           this._validateAction(action);
+          // Budget ledger: one LLM (reasoner) call consumed.
+          this.budgetManager?.recordModelCall();
         } catch (err) {
           this._emit(LoopEvents.ERROR, { step, phase: 'think', error: serializeError(err) });
           log.error('step:think_failed', { step, error: serializeError(err) });
@@ -830,6 +863,8 @@ export class AgentLoop {
         ({ result, attempts } = await this._executeWithRetry(action, retryPolicy, { step, signal }));
       }
       const actDurationMs = Date.now() - actStartedAt;
+      // Budget ledger: tool executions consumed (count each parallel call).
+      this.budgetManager?.recordToolCall(isParallel ? action.tools.length : 1);
 
       if (!result.ok && attempts > retryPolicy.retries) {
         this._consecutiveToolExhaustion += 1;
@@ -862,6 +897,37 @@ export class AgentLoop {
         output: result.ok ? result.data : result.error,
         durationMs: actDurationMs,
       });
+
+      // --- EVALUATE: think → act → observe → evaluate → continue / repair / finish ---
+      // The critic (EvaluationEngine) judges whether the observation actually
+      // moved us toward the goal. When a verification tool result backs the
+      // claim, it is passed through so the verdict is evidence-driven, never a
+      // bare "I think it worked".
+      if (this.evaluator && typeof this.evaluator.evaluate === 'function') {
+        try {
+          const verdict = await this.evaluator.evaluate({
+            goal: this.goalState?.goal ?? (this.currentRun?.input || ''),
+            action,
+            observation: result.ok ? result.data : result,
+            verification: result.ok && result.data && typeof result.data === 'object'
+              && 'ok' in result.data && 'passed' in result.data
+              ? { ok: result.data.ok, passed: result.data.passed, failed: result.data.failed, total: result.data.total }
+              : null,
+          });
+          this._recordStep({ step, phase: 'evaluate', verdict, durationMs: actDurationMs });
+          this._emit(LoopEvents.EVALUATE, { step, tool: observeTool, verdict });
+          // Steer the reasoner toward repair when the critic is unconvinced,
+          // instead of letting it drift into a low-confidence "final".
+          if (verdict.next === 'repair') {
+            await this.context.append({
+              role: 'system',
+              content: `[evaluation] Previous step did not satisfy the goal (confidence ${verdict.confidence}): ${verdict.reason}. Repair and retry rather than declaring completion.`,
+            });
+          }
+        } catch (err) {
+          log.warn('step:evaluate_failed', { step, error: err && err.message });
+        }
+      }
 
       // --- ERROR RECOVERY: give up only after repeated, consecutive exhaustion ---
       if (this._consecutiveToolExhaustion >= this.maxConsecutiveToolExhaustion) {
@@ -1046,7 +1112,7 @@ export class AgentLoop {
       }
     }
 
-    return {
+    const result = {
       status,
       reason,
       steps: step,
@@ -1065,6 +1131,18 @@ export class AgentLoop {
       }),
       ...extra,
     };
+
+    // Goal completion detector: can we prove the goal is satisfied? Attach the
+    // GoalState summary + artifact ledger snapshot so the final result carries
+    // evidence, not just a bare "final".
+    if (this.goalState) result.goal = this.goalState.toJSON();
+    if (this.artifactManager) {
+      result.artifacts = this.artifactManager.snapshot();
+      result.artifactStats = this.artifactManager.stats();
+    }
+    if (this.budgetManager) result.budget = this.budgetManager.toJSON();
+
+    return result;
   }
 
   /**

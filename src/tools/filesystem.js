@@ -1,12 +1,13 @@
 /**
  * tools/filesystem.js — the full filesystem tool suite
  * -----------------------------------------------------
- * Nine tools, all confined to a sandbox root (path traversal and absolute
+ * Ten tools, all confined to a sandbox root (path traversal and absolute
  * paths outside the root are rejected before any fs call):
  *
  *   read_file      read a UTF-8 text file (capped)
  *   write_file     create/overwrite/append a file (capped, creates parents)
  *   edit_file      targeted find/replace edit (literal or regex), no full rewrite
+ *   apply_patch    patch-based editing: read → validate → apply atomically → verify
  *   list_dir       list a directory (flat or recursive, depth-capped)
  *   search_files   find files by glob pattern, optionally grep contents
  *   make_dir       mkdir -p
@@ -22,6 +23,7 @@
 
 import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createLogger } from '../core/logger.js';
 import { createSandbox } from '../security/sandbox.js';
 
@@ -434,7 +436,120 @@ export function createFilesystemTools(opts = {}) {
     },
   };
 
-  return [readTool, writeTool, editTool, listTool, searchTool, mkdirTool, moveTool, copyTool, deleteTool];
+  // --- Patch-based editing ----------------------------------------------
+  // read → validate patch → apply atomically → (optionally) verify.
+  // Safer than a blind full overwrite: every hunk must match exactly once or
+  // the whole patch is rejected with VALIDATION_ERROR (nothing is written).
+  const patchTool = {
+    name: 'apply_patch',
+    description: `Apply a structured patch to a file atomically: read → validate → apply → (optionally) verify. A patch is a list of hunks, each {old, new}. Every "old" must exist exactly once in the file or the ENTIRE patch is rejected and nothing is written. Safer than a blind full-file overwrite.`,
+    version: '1.0.0',
+    parameters: {
+      file: { type: 'string', required: true, description: 'Path relative to sandbox root.' },
+      hunks: {
+        type: 'array',
+        required: true,
+        description: 'List of patch hunks: [{old: string, new: string}]. Each "old" must appear exactly once.',
+      },
+      verify: {
+        type: 'object',
+        description: 'Optional post-apply check: {command: string, expectedExitCode: number}. Runs after applying and is included in the result.',
+      },
+    },
+    handler: async (args) => {
+      const abs = resolveSafe(args.file);
+      let content;
+      try {
+        content = await fs.readFile(abs, 'utf8');
+      } catch (err) {
+        throw fileError(`Failed to read "${args.file}": ${err.message}`, err.code || 'READ_ERROR');
+      }
+      const hunks = Array.isArray(args.hunks) ? args.hunks : [];
+      if (hunks.length === 0) {
+        throw fileError('apply_patch requires a non-empty "hunks" array.', 'VALIDATION_ERROR');
+      }
+
+      // Validate every hunk against the ORIGINAL content first — all hunks
+      // must match exactly once; otherwise reject before touching the file.
+      for (let i = 0; i < hunks.length; i += 1) {
+        const h = hunks[i];
+        if (!h || typeof h.old !== 'string') {
+          throw fileError(`Hunk ${i + 1} is missing a string "old".`, 'VALIDATION_ERROR');
+        }
+        const matches = content.split(h.old).length - 1;
+        if (matches !== 1) {
+          throw fileError(
+            `Hunk ${i + 1} "old" matched ${matches} time(s) — each hunk must match exactly once.`,
+            'VALIDATION_ERROR'
+          );
+        }
+      }
+
+      // Apply atomically: validate all passed, so now build the final content
+      // and write it once. This never leaves a half-patched file.
+      let next = content;
+      const applied = [];
+      for (let i = 0; i < hunks.length; i += 1) {
+        const h = hunks[i];
+        const idx = next.indexOf(h.old);
+        if (idx === -1) {
+          // Should not happen (validated above), but guard anyway.
+          throw fileError(`Hunk ${i + 1} "old" not found during apply.`, 'VALIDATION_ERROR');
+        }
+        next = next.slice(0, idx) + (h.new || '') + next.slice(idx + h.old.length);
+        applied.push(i + 1);
+      }
+      if (next.length > maxWriteChars) {
+        throw fileError(`Result would be ${next.length} chars, exceeds limit of ${maxWriteChars}.`, 'WRITE_TOO_LARGE');
+      }
+      await fs.writeFile(abs, next, 'utf8');
+
+      const output = {
+        path: args.file,
+        hunksApplied: applied.length,
+        totalChars: next.length,
+        beforeHash: sha256hex(content),
+        afterHash: sha256hex(next),
+      };
+
+      // Optional post-apply verification step.
+      if (args.verify && typeof args.verify === 'object' && args.verify.command) {
+        output.verify = await runVerifyCommand(args.verify, { cwd: root });
+      }
+
+      log.info('apply_patch:done', { path: args.file, hunksApplied: output.hunksApplied });
+      return output;
+    },
+  };
+
+  return [readTool, writeTool, editTool, listTool, searchTool, mkdirTool, moveTool, copyTool, deleteTool, patchTool];
+}
+
+function sha256hex(text) {
+  return createHash('sha256').update(String(text)).digest('hex');
+}
+
+async function runVerifyCommand(verify, { cwd }) {
+  const { execa } = await import('execa');
+  const start = Date.now();
+  try {
+    const proc = await execa(verify.command, {
+      shell: true,
+      cwd,
+      timeout: verify.timeoutMs || 30_000,
+      reject: false,
+    });
+    return {
+      ok: (proc.exitCode ?? 0) === (verify.expectedExitCode ?? 0),
+      exitCode: proc.exitCode ?? 0,
+      expectedExitCode: verify.expectedExitCode ?? 0,
+      stdout: proc.stdout.slice(0, 1000),
+      stderr: proc.stderr.slice(0, 1000),
+      durationMs: Date.now() - start,
+    };
+  } catch (err) {
+    return { ok: false, error: err.message, durationMs: Date.now() - start };
+  }
 }
 
 function fileError(message, code) {
