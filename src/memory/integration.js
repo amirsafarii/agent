@@ -1,7 +1,7 @@
 /**
- * memory-integration.js — wires the Pulse memory system into a built AgentLoop
+ * memory/integration.js — wires the Pulse memory system into a built AgentLoop
  * -----------------------------------------------
- * Kept out of loop.js on purpose: loop.js's think -> act -> observe cycle
+ * Kept out of core/loop on purpose: the loop's think -> act -> observe cycle
  * is provider/storage-agnostic by design (see its own header comment) and
  * already fully unit-tested against that contract. This file wraps an
  * already-built agent's `.run()` so every turn:
@@ -21,7 +21,7 @@
  * so a Redis/network hiccup degrades a turn's context, it never breaks it.
  */
 
-import { createLogger } from './logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('memory-integration');
 

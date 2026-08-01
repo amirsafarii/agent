@@ -5,10 +5,10 @@
  * kernel logger (`childLogger(name)` -> `{info,warn,error}`, called
  * pino-style as `log.warn({ err, ... }, "message")` or `log.info("message")`).
  * Rather than keep a second, divergent logging implementation, this shim
- * now forwards every call into src/logger.js so memory-layer log lines get
+ * now forwards every call into src/core/logger.js so memory-layer log lines get
  * the same structured shape (state/params/output, redaction, level
  * filtering via SCRAPPYAI_LOG_LEVEL, json/pretty via SCRAPPYAI_LOG_FORMAT)
- * as loop.js/tools.js/context.js/reasoner.js — one logger, one set of env
+ * as the core loop/tools/context/reasoner — one logger, one set of env
  * knobs, everywhere in ScrappyAi.
  *
  * SCRAPPYAI_MEMORY_LOG=false remains a memory-specific silence switch (on
@@ -16,7 +16,7 @@
  * tests without turning off logging for the rest of the agent.
  */
 
-import { createLogger } from '../../logger.js';
+import { createLogger } from '../../core/logger.js';
 
 function memorySilenced() {
   return String(process.env.SCRAPPYAI_MEMORY_LOG).toLowerCase() === 'false';

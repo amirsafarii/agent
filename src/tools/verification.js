@@ -12,8 +12,8 @@
  * Pure JavaScript (ES modules).
  */
 
-import { VerificationEngine, defaultVerificationEngine } from '../verification.js';
-import { createLogger } from '../logger.js';
+import { VerificationEngine, defaultVerificationEngine } from '../verification/index.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools:verification');
 
@@ -21,7 +21,7 @@ const log = createLogger('tools:verification');
  * @param {Object} [opts]
  * @param {VerificationEngine} [opts.engine]
  * @param {string} [opts.rootDir]
- * @returns {Array<import('../tools.js').ToolDefinition>}
+ * @returns {Array<import('./registry.js').ToolDefinition>}
  */
 export function createVerificationTools(opts = {}) {
   const engine = opts.engine || (opts.rootDir ? new VerificationEngine({ rootDir: opts.rootDir }) : defaultVerificationEngine);

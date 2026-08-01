@@ -39,7 +39,7 @@ export class CheckpointManager {
 
   /**
    * Store a checkpoint snapshot (from AgentLoop.checkpoint()) under a fresh id.
-   * @param {object} snapshot - see LOOP.md → Checkpoint.
+   * @param {object} snapshot - see docs/LOOP.md → Checkpoint.
    * @param {object} [meta] - free-form tag, e.g. { label: 'before-risky-tool', step: snapshot.step }.
    * @returns {Promise<string>} the generated checkpoint id
    */

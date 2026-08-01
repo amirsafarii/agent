@@ -1,5 +1,5 @@
 /**
- * loop.js — Agent Loop (think → act → observe)
+ * loop/agent-loop.js — Agent Loop (think → act → observe)
  * -----------------------------------------------
  * The heart of ScrappyAi. Orchestrates ContextWindow + ToolRegistry around a
  * pluggable `reasoner` (the actual LLM call lives outside this file — inject
@@ -16,240 +16,27 @@
  * the chat-shaped ContextWindow, and a loop that fails loud with an explicit
  * termination reason rather than spinning silently forever.
  *
- * Full input/output schema for every function in this file: see LOOP.md.
+ * The fixed vocabularies and engines this class is built from live in their
+ * own modules: ./events.js (LoopEvents/TerminationReason/ActionType),
+ * ./errors.js (LoopError), ./state-machine.js (LoopStateMachine),
+ * ./stop-conditions.js (StopConditionEngine), ./compression.js (default
+ * tool-result compression + helpers). All of them are re-exported from
+ * ./index.js, the public entry for the loop module.
+ *
+ * Full input/output schema for every function in this file: see docs/LOOP.md.
  *
  * Pure JavaScript (ES modules). No TypeScript, no build step.
  */
 
-import { createLogger } from './logger.js';
-import { CheckpointManager } from './checkpoint-manager.js';
+import { createLogger } from '../logger.js';
+import { CheckpointManager } from '../checkpoint-manager.js';
+import { LoopEvents, TerminationReason, ActionType } from './events.js';
+import { LoopError } from './errors.js';
+import { LoopState, LoopStateMachine, statusToLoopState } from './state-machine.js';
+import { StopConditionEngine, wrapLegacyStopCondition } from './stop-conditions.js';
+import { DEFAULT_COMPRESS_MAX_CHARS, defaultCompressToolResult, normalizeArgs, sleep, serializeError } from './compression.js';
 
 const log = createLogger('loop');
-
-/** Every event AgentLoop can emit via the `onEvent(event, payload)` hook. */
-export const LoopEvents = Object.freeze({
-  STEP_START: 'step_start',
-  THINK: 'think',
-  ACT: 'act',
-  TOOL_RETRY: 'tool_retry',
-  OBSERVE: 'observe',
-  FINAL: 'final',
-  NEED_CLARIFICATION: 'need_clarification',
-  ERROR: 'error',
-  MAX_STEPS: 'max_steps_reached',
-  TASK_TIMEOUT: 'task_timeout',
-  MAX_TOKENS: 'max_tokens_exceeded',
-  STUCK_LOOP: 'stuck_loop_detected',
-  TOOL_FAILURE_EXHAUSTED: 'tool_failure_exhausted',
-  PAUSED: 'paused',
-  RESUMED: 'resumed',
-  CHECKPOINT_CREATED: 'checkpoint_created',
-  STATE_CHANGE: 'state_change',
-  TOOL_APPROVAL_REQUESTED: 'tool_approval_requested',
-  TOOL_APPROVAL_GRANTED: 'tool_approval_granted',
-  TOOL_APPROVAL_REJECTED: 'tool_approval_rejected',
-  LIFECYCLE_CREATED: 'lifecycle_created',
-  LIFECYCLE_FAILED: 'lifecycle_failed',
-  TOOL_OVERUSE: 'tool_overuse',
-  SIMILAR_CALL: 'similar_call',
-  BUDGET_EXTENDED: 'budget_extended',
-});
-
-/**
- * Fixed set of states the State Management Engine can be in. A run only ever
- * moves along the edges declared in STATE_TRANSITIONS below — anything else
- * throws instead of silently corrupting loop state. See LOOP.md → LoopState.
- *
- * The macro lifecycle a caller cares about is exactly:
- *   CREATED -> RUNNING -> AWAITING_TOOL_APPROVAL -> PAUSED -> RESUMED -> COMPLETED / FAILED
- * THINKING/ACTING/OBSERVING are the finer-grained execution phases *inside*
- * RUNNING (kept because step-by-step observability — logs, events, the
- * think->act->observe history assertions — depends on them), but every one
- * of the macro states above is a real, reachable, distinct state.
- */
-export const LoopState = Object.freeze({
-  CREATED: 'created',
-  RUNNING: 'running',
-  THINKING: 'thinking',
-  ACTING: 'acting',
-  AWAITING_TOOL_APPROVAL: 'awaiting_tool_approval',
-  OBSERVING: 'observing',
-  PAUSED: 'paused',
-  RESUMED: 'resumed',
-  COMPLETED: 'completed',
-  FAILED: 'failed',
-});
-
-const STATE_TRANSITIONS = Object.freeze({
-  created: ['running'],
-  // 'acting' from 'running' is legal because a resumeWithApproval(checkpoint,
-  // true) run enters ACT directly with its action already decided (no THINK),
-  // and a fresh run() never takes this edge — it always goes running->thinking
-  // first. Without it, the state machine would silently refuse to log the
-  // acting/observing phases of an approved resume.
-  running: ['thinking', 'acting', 'completed', 'failed', 'paused'],
-  thinking: ['acting', 'awaiting_tool_approval', 'completed', 'failed', 'paused'],
-  awaiting_tool_approval: ['acting', 'thinking', 'paused', 'failed', 'resumed'],
-  acting: ['observing', 'failed'],
-  observing: ['thinking', 'completed', 'failed', 'paused'],
-  paused: ['resumed', 'created'],
-  resumed: ['running'],
-  completed: ['created', 'running'],
-  failed: ['created', 'running'],
-});
-
-/**
- * State Management Engine — a small, explicit state machine for AgentLoop.
- * Every legal move is declared in STATE_TRANSITIONS; an illegal move throws
- * LoopError('INVALID_STATE_TRANSITION') rather than leaving `.current` in an
- * ambiguous place. Full history of every transition is kept for
- * debugging/audit (see LOOP.md → LoopStateMachine).
- */
-export class LoopStateMachine {
-  constructor(initial = LoopState.CREATED) {
-    this._current = initial;
-    this._history = [{ from: null, to: initial, at: Date.now(), meta: {} }];
-  }
-
-  get current() {
-    return this._current;
-  }
-
-  /** Full chronological transition log: [{from, to, at, meta}]. */
-  getHistory() {
-    return this._history.slice();
-  }
-
-  canTransition(to) {
-    return (STATE_TRANSITIONS[this._current] || []).includes(to);
-  }
-
-  transition(to, meta = {}) {
-    if (!Object.values(LoopState).includes(to)) {
-      throw new LoopError(`Unknown loop state "${to}".`, 'INVALID_STATE');
-    }
-    if (!this.canTransition(to)) {
-      throw new LoopError(`Invalid state transition: "${this._current}" -> "${to}".`, 'INVALID_STATE_TRANSITION');
-    }
-    const from = this._current;
-    this._current = to;
-    this._history.push({ from, to, at: Date.now(), meta });
-    return this;
-  }
-
-  /** Hard reset (used by checkpoint/resume) — bypasses transition validation on purpose. */
-  reset(to = LoopState.CREATED) {
-    this._current = to;
-    this._history = [{ from: null, to, at: Date.now(), meta: { reset: true } }];
-    return this;
-  }
-}
-
-function statusToLoopState(status) {
-  if (status === 'error' || status === 'aborted') return LoopState.FAILED;
-  if (status === 'paused') return LoopState.PAUSED;
-  if (status === 'awaiting_tool_approval') return LoopState.AWAITING_TOOL_APPROVAL;
-  return LoopState.COMPLETED; // final, need_clarification, stopped, max_steps
-}
-
-/**
- * Stop Condition Engine — every pre-think "should this run stop right now?"
- * check (built-in and custom) lives here as one named, prioritized,
- * side-effect-free predicate instead of scattered if-blocks. Lower priority
- * number = checked first. A condition returns:
- *   - falsy            -> no opinion, keep checking
- *   - true             -> stop, reason defaults to the condition's name
- *   - a string         -> stop, that string is the `reason`
- *   - {reason, status, message} -> stop with exact control over the result
- * See LOOP.md → StopConditionEngine.
- */
-export class StopConditionEngine {
-  constructor() {
-    this._conditions = []; // [{name, fn, priority}]
-  }
-
-  register(name, fn, { priority = 100 } = {}) {
-    if (typeof name !== 'string' || !name.trim()) {
-      throw new LoopError('StopConditionEngine.register() requires a non-empty string "name".', 'INVALID_STOP_CONDITION');
-    }
-    if (typeof fn !== 'function') {
-      throw new LoopError(`Stop condition "${name}" must be a function.`, 'INVALID_STOP_CONDITION');
-    }
-    this._conditions = this._conditions.filter((c) => c.name !== name); // re-register replaces
-    this._conditions.push({ name, fn, priority });
-    this._conditions.sort((a, b) => a.priority - b.priority);
-    return this;
-  }
-
-  unregister(name) {
-    this._conditions = this._conditions.filter((c) => c.name !== name);
-    return this;
-  }
-
-  list() {
-    return this._conditions.map((c) => ({ name: c.name, priority: c.priority }));
-  }
-
-  /**
-   * Evaluate every registered condition, in priority order, against `state`.
-   * Stops at the first one that fires.
-   * @returns {{name, reason, status, message}|null}
-   */
-  evaluate(state) {
-    for (const { name, fn } of this._conditions) {
-      let outcome;
-      try {
-        outcome = fn(state);
-      } catch (err) {
-        log.warn('stopCondition:threw', { name, error: err && err.message });
-        outcome = null; // a broken custom condition must never crash the loop
-      }
-      if (!outcome) continue;
-      if (outcome === true) {
-        return { name, reason: name, status: 'stopped', message: `Stop condition "${name}" triggered.` };
-      }
-      if (typeof outcome === 'string') {
-        return { name, reason: outcome, status: 'stopped', message: `Stop condition "${name}" triggered: ${outcome}` };
-      }
-      if (typeof outcome === 'object') {
-        return {
-          name,
-          reason: outcome.reason || name,
-          status: outcome.status || 'stopped',
-          message: outcome.message || `Stop condition "${name}" triggered.`,
-        };
-      }
-    }
-    return null;
-  }
-}
-
-/**
- * Fixed, exhaustive set of reasons a run() can end. Every terminal return
- * carries exactly one of these in `reason` — never a free-text guess.
- */
-export const TerminationReason = Object.freeze({
-  FINAL_ANSWER: 'final_answer',
-  NEED_CLARIFICATION: 'need_clarification',
-  MAX_STEPS: 'max_steps_reached',
-  TASK_TIMEOUT: 'task_timeout',
-  MAX_TOKENS: 'max_tokens_exceeded',
-  STUCK_LOOP: 'stuck_loop_detected',
-  TOOL_FAILURE_EXHAUSTED: 'tool_failure_exhausted',
-  TOOL_OVERUSE: 'tool_overuse',
-  ABORTED: 'aborted_by_signal',
-  THINK_ERROR: 'think_phase_error',
-  INVALID_ACTION: 'invalid_action',
-  PAUSED: 'paused_by_request',
-  AWAITING_TOOL_APPROVAL: 'awaiting_tool_approval',
-});
-
-/** Fixed set of Action `type` values a reasoner is allowed to return. */
-export const ActionType = Object.freeze({
-  TOOL_CALL: 'tool_call',
-  FINAL: 'final',
-  NEED_CLARIFICATION: 'need_clarification',
-});
 
 // Deliberately narrow: only generic execution errors are retried. Timeouts
 // (TOOL_TIMEOUT) and network-shaped failures (REQUEST_FAILED / HTTP_ERROR /
@@ -264,25 +51,16 @@ const DEFAULT_TOOL_RETRY = Object.freeze({
 });
 
 const DEFAULT_MAX_TASK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes wall clock per run()
-const DEFAULT_COMPRESS_MAX_CHARS = 1500;
 const DEFAULT_MAX_CONSECUTIVE_TOOL_EXHAUSTION = 2;
 const DEFAULT_MAX_TOOL_CALLS_PER_TOOL = 8; // hard per-run cap per tool name
 const DEFAULT_SIMILAR_WINDOW = 8; // how many recent tool calls to compare for similarity warnings
 
-export class LoopError extends Error {
-  constructor(message, code = 'LOOP_ERROR') {
-    super(message);
-    this.name = 'LoopError';
-    this.code = code;
-  }
-}
-
 export class AgentLoop {
   /**
    * @param {Object} opts
-   * @param {import('./context.js').ContextWindow} opts.context
-   * @param {import('./tools.js').ToolRegistry} opts.tools
-   * @param {Function} opts.reasoner - async (renderedContext, toolSchema) => Action. See ActionType/LOOP.md.
+   * @param {import('../context.js').ContextWindow} opts.context
+   * @param {import('../../tools/registry.js').ToolRegistry} opts.tools
+   * @param {Function} opts.reasoner - async (renderedContext, toolSchema) => Action. See ActionType/docs/LOOP.md.
    * @param {number} [opts.maxSteps=12] Hard ceiling on think/act/observe cycles per run.
    * @param {number} [opts.maxRepeatedToolCalls=3] Abort if the same tool+args repeats this many times in a row.
    * @param {number} [opts.maxTaskTimeoutMs=300000] Wall-clock ceiling for one run() call, independent of maxSteps.
@@ -310,7 +88,7 @@ export class AgentLoop {
    *        registered under the given name (so you can .unregister()/inspect it later via `loop.stopEngine`).
    * @param {string[]|'*'} [opts.requireApprovalFor=[]] Tool names that must go through the
    *        AWAITING_TOOL_APPROVAL gate before executing; `'*'` gates every tool_call. A tool
-   *        definition's own `requiresApproval: true` (see tools.js) also gates it, OR'd with this list.
+   *        definition's own `requiresApproval: true` (see tools/registry.js) also gates it, OR'd with this list.
    * @param {Function} [opts.onToolApproval] Optional async (request) => boolean | {approved, reason}
    *        hook, where request = {tool, args, reasoning, step}. When provided, a gated tool_call is
    *        decided automatically (no pause). When omitted, a gated tool_call PAUSES the run with
@@ -378,7 +156,7 @@ export class AgentLoop {
     this._toolCallHistory = []; // recent tool_call fingerprints, for stuck-loop detection
     this._toolCallCounts = {}; // per-tool call counter for the tool-overuse guard
     this._similarCallHistory = []; // normalized fingerprints of recent calls, for similarity warnings
-    this._stepMemory = []; // structured, non-chat record of every step — see LOOP.md StepRecord
+    this._stepMemory = []; // structured, non-chat record of every step — see docs/LOOP.md StepRecord
     this._consecutiveToolExhaustion = 0;
     this._pauseRequested = false;
     this._currentStep = 0;
@@ -503,7 +281,7 @@ export class AgentLoop {
   /**
    * Whether a tool_call to `toolName` must go through the AWAITING_TOOL_APPROVAL
    * gate: either this loop's `requireApprovalFor` says so, or the tool's own
-   * definition (`requiresApproval: true`, see tools.js) does.
+   * definition (`requiresApproval: true`, see tools/registry.js) does.
    */
   _requiresApproval(toolName) {
     if (this.requireApprovalFor === '*') return true;
@@ -536,7 +314,7 @@ export class AgentLoop {
    * Snapshot everything needed to continue this run later: full ContextWindow
    * state, step memory, tool-call history (for stuck-loop detection), the
    * consecutive-tool-exhaustion counter, and how many ms of the task timeout
-   * budget have already been spent. See LOOP.md → Checkpoint.
+   * budget have already been spent. See docs/LOOP.md → Checkpoint.
    */
   checkpoint(meta = {}) {
     const step = meta.step ?? this._currentStep ?? 0;
@@ -569,13 +347,13 @@ export class AgentLoop {
    * stay whatever they already are — restore only overwrites their content).
    * Step numbering and the task-timeout clock both continue from where the
    * checkpoint left off; maxSteps/maxTaskTimeoutMs are NOT reset.
-   * @param {Object} checkpointObj - see LOOP.md → Checkpoint.
+   * @param {Object} checkpointObj - see docs/LOOP.md → Checkpoint.
    * @param {{additionalInput?: string, signal?: AbortSignal}} [runOpts]
    * @returns {Promise<LoopResult>}
    */
   async resume(checkpointObj, runOpts = {}) {
     if (!checkpointObj || typeof checkpointObj !== 'object' || !checkpointObj.context) {
-      throw new LoopError('resume() requires a valid checkpoint object (see checkpoint()/LOOP.md).', 'INVALID_CHECKPOINT');
+      throw new LoopError('resume() requires a valid checkpoint object (see checkpoint()/docs/LOOP.md).', 'INVALID_CHECKPOINT');
     }
     if (checkpointObj.pendingApproval) {
       throw new LoopError(
@@ -603,7 +381,7 @@ export class AgentLoop {
    * status:'awaiting_tool_approval' result (checkpoint.pendingApproval) and
    * continue the run. If `approved` is false, the gated tool_call is
    * recorded as rejected and the run continues to the next THINK instead of
-   * executing it. See LOOP.md → Tool Approval.
+   * executing it. See docs/LOOP.md → Tool Approval.
    * @param {Object} checkpointObj - a checkpoint whose `pendingApproval` is set.
    * @param {boolean} approved
    * @param {{additionalInput?: string, reason?: string, signal?: AbortSignal}} [runOpts]
@@ -692,7 +470,7 @@ export class AgentLoop {
     return seenEarlier;
   }
 
-  /** Structured, non-chat record of every step this run has executed so far. See LOOP.md StepRecord. */
+  /** Structured, non-chat record of every step this run has executed so far. See docs/LOOP.md StepRecord. */
   getStepMemory() {
     return this._stepMemory.slice();
   }
@@ -700,8 +478,8 @@ export class AgentLoop {
   /**
    * Run the loop to completion for one user turn.
    * @param {string} userInput
-   * @param {{signal?: AbortSignal}} [runOpts]
-   * @returns {Promise<LoopResult>} see LOOP.md for the exact LoopResult schema.
+   * @param {{signal?: AbortSignal, maxSteps?: number}} [runOpts]
+   * @returns {Promise<LoopResult>} see docs/LOOP.md for the exact LoopResult schema.
    */
   async run(userInput, runOpts = {}) {
     return this._execute({ userInput, runOpts, resumeFrom: null });
@@ -1073,7 +851,7 @@ export class AgentLoop {
 
   /**
    * Build the final LoopResult. Always attaches the current state and a
-   * fresh checkpoint (see LOOP.md → Checkpoint) so ANY terminal result —
+   * fresh checkpoint (see docs/LOOP.md → Checkpoint) so ANY terminal result —
    * not just an explicit pause() — can be handed to resume() later.
    */
   _terminate({ status, reason, step, startedAt, extra = {} }) {
@@ -1094,7 +872,7 @@ export class AgentLoop {
   /**
    * Validate a reasoner's Action against the fixed schema. Throws LoopError
    * (code INVALID_ACTION) rather than letting a malformed action silently
-   * corrupt loop state. See LOOP.md → Action schema.
+   * corrupt loop state. See docs/LOOP.md → Action schema.
    */
   _validateAction(action) {
     if (!action || typeof action !== 'object') {
@@ -1129,81 +907,6 @@ export class AgentLoop {
         );
     }
   }
-}
-
-/**
- * Default tool-result compression written into ContextWindow (the
- * token-budgeted chat trace). Step memory always keeps the untouched
- * original — this only shrinks what gets sent back to the model.
- */
-function defaultCompressToolResult(result, { maxChars = DEFAULT_COMPRESS_MAX_CHARS } = {}) {
-  if (!result || typeof result !== 'object') return result;
-  const clone = { ...result };
-  if (clone.ok && clone.data !== undefined) {
-    clone.data = compressValue(clone.data, maxChars);
-  }
-  if (!clone.ok && typeof clone.error === 'string' && clone.error.length > maxChars) {
-    clone.error = `${clone.error.slice(0, maxChars)}...[truncated ${clone.error.length - maxChars} chars]`;
-  }
-  return clone;
-}
-
-function compressValue(value, maxChars) {
-  const asString = typeof value === 'string' ? value : safeStringify(value);
-  if (asString.length <= maxChars) return value;
-  const truncated = `${asString.slice(0, maxChars)}...[truncated ${asString.length - maxChars} chars, ${typeof value} result]`;
-  return truncated;
-}
-
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value);
-  } catch (_err) {
-    return String(value);
-  }
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Stable JSON serialization of tool args: object keys sorted recursively. */
-function normalizeArgs(args) {
-  if (args === null || args === undefined) return '{}';
-  try {
-    return JSON.stringify(sortKeys(args));
-  } catch (_err) {
-    return String(args);
-  }
-}
-
-function sortKeys(value) {
-  if (Array.isArray(value)) return value.map(sortKeys);
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const key of Object.keys(value).sort()) out[key] = sortKeys(value[key]);
-    return out;
-  }
-  return value;
-}
-
-/** Adapt a legacy `(state) => reason|null` stop condition to the Stop Condition Engine's richer contract. */
-function wrapLegacyStopCondition(fn) {
-  return (state) => {
-    let outcome;
-    try {
-      outcome = fn(state);
-    } catch (err) {
-      log.warn('stopCondition:legacy_failed', { error: err && err.message });
-      return null;
-    }
-    return outcome || null;
-  };
-}
-
-function serializeError(err) {
-  if (!err) return null;
-  return { message: err.message, code: err.code, stack: err.stack };
 }
 
 export default AgentLoop;

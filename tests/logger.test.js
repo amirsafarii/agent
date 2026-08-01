@@ -9,7 +9,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitize } from '../src/logger.js';
+import { sanitize } from '../src/core/logger.js';
 
 test('redacts credential-shaped keys recursively', () => {
   const out = sanitize({

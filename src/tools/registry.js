@@ -1,5 +1,5 @@
 /**
- * tools.js — Tool Registry
+ * tools/registry.js — Tool Registry
  * -----------------------------------------------
  * Register tools with a JSON-schema-ish contract, execute them with real
  * argument validation, a per-tool timeout, and error handling that never
@@ -9,7 +9,7 @@
  * Pure JavaScript (ES modules). No TypeScript, no build step.
  */
 
-import { createLogger } from './logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools');
 
@@ -35,7 +35,7 @@ export class ToolError extends Error {
  * @property {Function} handler - async (args, ctx) => any
  * @property {number} [timeoutMs=15000]
  * @property {boolean} [requiresApproval=false] - gate every call through AgentLoop's
- *        AWAITING_TOOL_APPROVAL lifecycle state before it executes. See LOOP.md → Tool Approval.
+ *        AWAITING_TOOL_APPROVAL lifecycle state before it executes. See docs/LOOP.md → Tool Approval.
  */
 
 const DEFAULT_TIMEOUT_MS = 15000;

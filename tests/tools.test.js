@@ -13,9 +13,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry } from '../src/tools.js';
+import { ToolRegistry } from '../src/tools/index.js';
 import { createShellTool } from '../src/tools/shell.js';
-import { createFileTools } from '../src/tools/files.js';
+import { createFilesystemTools } from '../src/tools/filesystem.js';
 import { createWebSearchTool } from '../src/tools/search.js';
 
 function newRegistry() {
@@ -147,7 +147,7 @@ test('shell tool: non-zero exit is reported, not thrown; empty command rejected'
 test('files tools: read/write/append inside the sandbox root', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scrappyai-files-'));
   const r = new ToolRegistry();
-  const { readTool, writeTool } = createFileTools({ rootDir: root });
+  const [readTool, writeTool] = createFilesystemTools({ rootDir: root });
   r.register(readTool);
   r.register(writeTool);
 
@@ -169,7 +169,7 @@ test('files tools: read/write/append inside the sandbox root', async () => {
 test('files tools: sandbox escapes are rejected before touching disk', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scrappyai-files-'));
   const r = new ToolRegistry();
-  const { readTool, writeTool } = createFileTools({ rootDir: root });
+  const [readTool, writeTool] = createFilesystemTools({ rootDir: root });
   r.register(readTool);
   r.register(writeTool);
 
@@ -186,7 +186,7 @@ test('files tools: sandbox escapes are rejected before touching disk', async () 
 test('files tools: read errors and write size cap are reported safely', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scrappyai-files-'));
   const r = new ToolRegistry();
-  const { readTool, writeTool } = createFileTools({ rootDir: root, maxWriteChars: 50 });
+  const [readTool, writeTool] = createFilesystemTools({ rootDir: root, maxWriteChars: 50 });
   r.register(readTool);
   r.register(writeTool);
 

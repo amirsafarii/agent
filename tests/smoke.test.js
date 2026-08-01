@@ -10,10 +10,10 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildAgent, loadSystemPrompt, createDefaultToolRegistry } from '../src/index.js';
-import { AgentLoop } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
-import { createScriptedClient } from '../src/reasoner.js';
+import { AgentLoop } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
+import { createScriptedClient } from '../src/core/reasoner.js';
 
 const originalFetch = global.fetch;
 

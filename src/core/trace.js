@@ -16,7 +16,7 @@
  *
  * Also renders the accumulated Step Memory as an "Agent Scratchpad" — the
  * durable, numbered Thought/Action/Observation/Final-Answer record of a run,
- * independent of the chat window (see LOOP.md → StepRecord).
+ * independent of the chat window (see docs/LOOP.md → StepRecord).
  *
  * No dependency: colors are plain ANSI escapes, disabled automatically when
  * stdout is not a TTY or NO_COLOR is set, so piping to a file/CI stays clean.
@@ -161,7 +161,7 @@ export function createTraceRenderer({ output = process.stdout, color, verbose = 
  * Final-Answer trail, independent of the (compressed, token-budgeted) chat
  * context. Returns a plain string; print it yourself (`console.log`) or pass
  * `output` to write it directly.
- * @param {import('./loop.js').StepRecord[]} stepMemory
+ * @param {import('./loop/index.js').StepRecord[]} stepMemory
  * @param {Object} [opts]
  * @param {boolean} [opts.color]
  * @param {NodeJS.WritableStream} [opts.output]

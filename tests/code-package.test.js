@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ToolRegistry } from '../src/tools.js';
+import { ToolRegistry } from '../src/tools/index.js';
 import { createCodeTools } from '../src/tools/code.js';
 import { createPackageTools } from '../src/tools/package.js';
 

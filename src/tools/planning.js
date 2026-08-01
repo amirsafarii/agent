@@ -13,15 +13,15 @@
  * Pure JavaScript (ES modules).
  */
 
-import { PlanningEngine, defaultPlanningEngine } from '../planning.js';
-import { createLogger } from '../logger.js';
+import { PlanningEngine, defaultPlanningEngine } from '../planning/index.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools:planning');
 
 /**
  * @param {Object} [opts]
  * @param {PlanningEngine} [opts.engine]
- * @returns {Array<import('../tools.js').ToolDefinition>}
+ * @returns {Array<import('./registry.js').ToolDefinition>}
  */
 export function createPlanningTools(opts = {}) {
   const engine = opts.engine || defaultPlanningEngine;

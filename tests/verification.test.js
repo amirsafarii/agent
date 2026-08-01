@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { VerificationEngine, VerificationPipeline } from '../src/verification.js';
+import { VerificationEngine, VerificationPipeline, assertPathInSandbox } from '../src/verification/index.js';
 import { createVerificationTools } from '../src/tools/verification.js';
-import { ToolRegistry } from '../src/tools.js';
+import { ToolRegistry } from '../src/tools/index.js';
 
 test('VerificationPipeline: execute pipeline stages', async () => {
   const root = mkdtempSync(join(tmpdir(), 'scrappyai-verif-pipe-'));
@@ -132,4 +132,42 @@ test('Verification tools: ToolRegistry integration and execution', async () => {
 
   const jsonRes = await registry.execute('verify_json', { path: 'data.json', requiredKeys: ['active'] });
   assert.equal(jsonRes.ok, true);
+});
+
+test('VerificationEngine: sibling-prefix paths cannot escape the sandbox', async () => {
+  // Regression: the old `resolved.startsWith(rootDir)` check accepted
+  // "/tmp/root-evil/x" for rootDir "/tmp/root" because the string merely
+  // starts with it — a sandbox escape through a same-prefix sibling dir.
+  const parent = mkdtempSync(join(tmpdir(), 'scrappyai-verif-parent-'));
+  const root = join(parent, 'root');
+  const evil = join(parent, 'root-evil');
+  mkdirSync(root);
+  mkdirSync(evil);
+  writeFileSync(join(evil, 'secret.txt'), 'top secret');
+
+  const engine = new VerificationEngine({ rootDir: root });
+  assert.throws(() => engine._resolvePath('../root-evil/secret.txt'), /Path escape detected/);
+  await assert.rejects(() => engine.verifyFile({ path: '../root-evil/secret.txt' }), /Path escape detected/);
+
+  // same contract on the shared validator, plus the legal boundary cases
+  assert.throws(() => assertPathInSandbox(root, '../root-evil/secret.txt'), /Path escape detected/);
+  assert.equal(assertPathInSandbox(root, 'secret.txt'), join(root, 'secret.txt'));
+  assert.equal(assertPathInSandbox(root, '.'), root, 'the sandbox root itself stays addressable');
+});
+
+test('VerificationEngine: suite dispatches type:"json" + path checks to verifyJson', async () => {
+  // Regression: shape-first dispatch routed any check carrying `path` to
+  // verifyFile, so {type:'json', path, requiredKeys} never validated keys.
+  const root = mkdtempSync(join(tmpdir(), 'scrappyai-verif-suite-dispatch-'));
+  writeFileSync(join(root, 'pkg.json'), '{"name": "my-pkg"}');
+
+  const engine = new VerificationEngine({ rootDir: root });
+  const res = await engine.runSuite({ checks: [{ type: 'json', path: 'pkg.json', requiredKeys: ['name'] }] });
+  assert.equal(res.ok, true);
+  assert.equal(res.results[0].check, 'json_valid', 'json checks must be validated by verifyJson, not verifyFile');
+
+  const bad = await engine.runSuite({ checks: [{ type: 'json', path: 'pkg.json', requiredKeys: ['scripts'] }] });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.results[0].check, 'json_keys');
+  assert.deepEqual(bad.results[0].missingKeys, ['scripts']);
 });

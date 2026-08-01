@@ -22,7 +22,7 @@
 
 import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { createLogger } from '../logger.js';
+import { createLogger } from '../core/logger.js';
 
 const log = createLogger('tools:filesystem');
 
@@ -37,7 +37,7 @@ const DEFAULT_MAX_SEARCH_RESULTS = 100;
  * @param {string} [opts.rootDir] sandbox root, defaults to process.cwd()
  * @param {number} [opts.maxReadChars]
  * @param {number} [opts.maxWriteChars]
- * @returns {Array<import('../tools.js').ToolDefinition>} nine registered-ready tool definitions
+ * @returns {Array<import('./registry.js').ToolDefinition>} nine registered-ready tool definitions
  */
 export function createFilesystemTools(opts = {}) {
   const {

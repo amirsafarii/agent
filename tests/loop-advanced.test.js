@@ -8,9 +8,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentLoop, TerminationReason, LoopEvents } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
+import { AgentLoop, TerminationReason, LoopEvents } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
 
 /** Build a loop whose reasoner replays a script of actions, then returns `final`. */
 function scriptedLoop({ script, loopOpts = {}, toolOpts = {} } = {}) {

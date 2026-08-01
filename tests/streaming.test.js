@@ -11,10 +11,10 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createNineRouterClient } from '../src/clients/9router.js';
-import { createReasoner, createScriptedClient } from '../src/reasoner.js';
-import { AgentLoop } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
+import { createReasoner, createScriptedClient } from '../src/core/reasoner.js';
+import { AgentLoop } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
 
 const BASE = { baseUrl: 'https://nine.example/v1', apiKey: 'sk-test', model: 'gpt-4o-mini' };
 

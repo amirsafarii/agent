@@ -8,7 +8,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { ToolRegistry } from '../src/tools.js';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ToolRegistry } from '../src/tools/index.js';
 import { createShellSpawnTool, createShellKillTool, createShellWhichTool, createShellTool } from '../src/tools/shell.js';
 
 function registry() {
@@ -89,8 +92,8 @@ test('shell tool rejects a cwd that escapes the sandbox root', async () => {
 });
 
 test('shell network/timeout errors are NOT retried by the loop (fail fast -> pivot)', async () => {
-  const { AgentLoop } = await import('../src/loop.js');
-  const { ContextWindow } = await import('../src/context.js');
+  const { AgentLoop } = await import('../src/core/loop/index.js');
+  const { ContextWindow } = await import('../src/core/context.js');
   const r = new ToolRegistry();
   let calls = 0;
   r.register({
@@ -121,4 +124,22 @@ test('shell network/timeout errors are NOT retried by the loop (fail fast -> piv
   const observe = result.stepMemory.filter((s) => s.phase === 'observe');
   assert.equal(observe.length, 2);
   assert.ok(observe.every((o) => o.attempts === 1), 'each call failed fast with 1 attempt');
+});
+
+test('shell tool: clean spawn env — nested `node --test` actually runs (no NODE_TEST_CONTEXT leak)', async () => {
+  // The outer test process runs under `node --test`, so NODE_TEST_CONTEXT is
+  // set in our env. If the shell tool leaked it into children, the nested
+  // `node --test` would print "skipping running files" and silently run
+  // NOTHING (exit code 0 either way) — verify real output made it through.
+  const root = mkdtempSync(join(tmpdir(), 'scrappyai-shell-env-'));
+  writeFileSync(
+    join(root, 'inner.test.js'),
+    "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\ntest('inner passes', () => { assert.equal(1, 1); });\n"
+  );
+  const r = new ToolRegistry();
+  r.register(createShellTool({ cwd: root }));
+  const res = await r.execute('shell', { command: `node --test ${join(root, 'inner.test.js')}` });
+  assert.equal(res.ok, true);
+  assert.equal(res.data.exitCode, 0);
+  assert.match(res.data.stdout, /# pass 1/, 'nested test run must produce real TAP output, not be silently skipped');
 });

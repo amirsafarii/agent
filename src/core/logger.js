@@ -1,7 +1,7 @@
 /**
- * logger.js — structured logger for ScrappyAi
+ * core/logger.js — structured logger for ScrappyAi
  * -----------------------------------------------
- * One logger, used everywhere: loop.js, tools.js, context.js, reasoner.js,
+ * One logger, used everywhere: the core loop, tools, context, reasoner,
  * clients/9router.js, index.js, repl.js, and (via a thin compat shim) the
  * memory layers. Every call site is one of `.debug/.info/.warn/.error(event,
  * fields)` — `event` is a short machine-stable name ("execute:start",

@@ -16,27 +16,28 @@
 
 import 'dotenv/config';
 import { readFileSync } from 'node:fs';
-import { AgentLoop } from './loop.js';
-import { ContextWindow } from './context.js';
-import { ToolRegistry } from './tools.js';
-import { createReasoner } from './reasoner.js';
+import { AgentLoop } from './core/loop/index.js';
+import { ContextWindow } from './core/context.js';
+import { createReasoner } from './core/reasoner.js';
+import { runRepl } from './core/repl.js';
+import { createTraceRenderer } from './core/trace.js';
+import { SessionLogger, attachSessionLogger } from './core/session-logger.js';
+import { createLogger } from './core/logger.js';
 import { createNineRouterClient } from './clients/9router.js';
-import { createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool } from './tools/shell.js';
-import { createFilesystemTools } from './tools/filesystem.js';
-import { createFileTools } from './tools/files.js';
-import { createWebSearchTool } from './tools/search.js';
-import { createCodeTools } from './tools/code.js';
-import { createPackageTools } from './tools/package.js';
-import { createPlanningTools } from './tools/planning.js';
-import { createVerificationTools } from './tools/verification.js';
-import { PlanningEngine } from './planning.js';
-import { VerificationEngine } from './verification.js';
-import { runRepl } from './repl.js';
+import {
+  ToolRegistry,
+  createFilesystemTools,
+  createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool,
+  createCodeTools,
+  createPackageTools,
+  createPlanningTools,
+  createVerificationTools,
+  createWebSearchTool,
+} from './tools/index.js';
+import { PlanningEngine } from './planning/index.js';
+import { VerificationEngine } from './verification/index.js';
 import { createMemory } from './memory/index.js';
-import { wireMemory } from './memory-integration.js';
-import { createLogger } from './logger.js';
-import { createTraceRenderer } from './trace.js';
-import { SessionLogger, attachSessionLogger } from './session-logger.js';
+import { wireMemory } from './memory/integration.js';
 import { randomUUID } from 'node:crypto';
 
 const log = createLogger('index');
@@ -150,11 +151,11 @@ export function loadSystemPrompt(override) {
  *   package:    npm, package_install, package_info
  *   web:        web_search
  * @param {Object} [opts]
- * @param {import('./tools.js').ToolRegistry} [opts.registry] reuse an existing registry instead of creating one
+ * @param {import('./tools/registry.js').ToolRegistry} [opts.registry] reuse an existing registry instead of creating one
  * @param {string} [opts.filesRoot] sandbox root for all file/shell/code/package tools,
  *        default process.env.SCRAPPYAI_FILES_ROOT || cwd
  * @param {string} [opts.shellCwd]
- * @returns {import('./tools.js').ToolRegistry}
+ * @returns {import('./tools/registry.js').ToolRegistry}
  */
 export function createDefaultToolRegistry(opts = {}) {
   const registry = opts.registry || new ToolRegistry();
@@ -191,11 +192,11 @@ export function createDefaultToolRegistry(opts = {}) {
  * Build a fully wired AgentLoop, with persistent memory attached unless
  * SCRAPPYAI_MEMORY_ENABLED=false. See memory/index.js for the "auto mode"
  * backend selection (in-process by default, Redis when SCRAPPYAI_REDIS_URL
- * is set) and memory-integration.js for exactly what gets injected/recorded
+ * is set) and memory/integration.js for exactly what gets injected/recorded
  * per turn.
  * @param {Object} [opts]
- * @param {import('./tools.js').ToolRegistry} [opts.tools] defaults to createDefaultToolRegistry()
- * @param {import('./context.js').ContextWindow} [opts.context]
+ * @param {import('./tools/registry.js').ToolRegistry} [opts.tools] defaults to createDefaultToolRegistry()
+ * @param {import('./core/context.js').ContextWindow} [opts.context]
  * @param {string} [opts.systemPrompt]
  * @param {Function} [opts.onEvent]
  * @param {string} [opts.userId] defaults to SCRAPPYAI_USER_ID env or "local" — identifies whose

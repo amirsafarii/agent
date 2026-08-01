@@ -10,11 +10,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable, Writable } from 'node:stream';
-import { runRepl } from '../src/repl.js';
-import { AgentLoop } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
-import { createScriptedClient, createReasoner } from '../src/reasoner.js';
+import { runRepl } from '../src/core/repl.js';
+import { AgentLoop } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
+import { createScriptedClient, createReasoner } from '../src/core/reasoner.js';
 
 /** Collect writes into an array while behaving like a Writable. */
 function memoryOutput() {

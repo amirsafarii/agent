@@ -49,7 +49,7 @@ const HELP_TEXT = [
  * Run an interactive multi-turn loop against a single, already-built agent.
  *
  * @param {Object} opts
- * @param {import('./loop.js').AgentLoop} opts.agent - built via buildAgent(); reused across every turn.
+ * @param {import('./loop/index.js').AgentLoop} opts.agent - built via buildAgent(); reused across every turn.
  * @param {string} [opts.systemPrompt] - only used for the /system command's display.
  * @param {NodeJS.ReadableStream} [opts.input=process.stdin]
  * @param {NodeJS.WritableStream} [opts.output=process.stdout]

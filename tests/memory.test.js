@@ -14,10 +14,10 @@ import assert from 'node:assert/strict';
 import { createMemory } from '../src/memory/index.js';
 import { MemoryManager } from '../src/memory/memory-manager.js';
 import { cosineSimilarity } from '../src/memory/embeddings.js';
-import { wireMemory } from '../src/memory-integration.js';
-import { AgentLoop } from '../src/loop.js';
-import { ToolRegistry } from '../src/tools.js';
-import { ContextWindow } from '../src/context.js';
+import { wireMemory } from '../src/memory/integration.js';
+import { AgentLoop } from '../src/core/loop/index.js';
+import { ToolRegistry } from '../src/tools/index.js';
+import { ContextWindow } from '../src/core/context.js';
 
 // The shared 9router client adapter (see memory/index.js) — a fake one with
 // the same shape; only used by the fact extractor's model call.
@@ -286,7 +286,7 @@ test('memory between turns: injected [memory] reaches the model via the reasoner
       return { type: 'final', content: 'got it' };
     },
   };
-  const { createReasoner } = await import('../src/reasoner.js');
+  const { createReasoner } = await import('../src/core/reasoner.js');
   const reasoner = createReasoner({ client, systemPrompt: 'sys' });
   const tools = new ToolRegistry();
   tools.register({ name: 'noop', description: 'x', handler: async () => 'ok' });
