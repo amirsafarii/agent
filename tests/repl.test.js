@@ -77,6 +77,29 @@ test('REPL: runs turns, prints final answers, handles /help /history /system /re
   assert.match(out, /bye\./, '/exit leaves');
 });
 
+test('REPL: /tools lists the registered tool suite', async () => {
+  const agent = makeAgent({ script: [{ type: 'final', content: 'x' }] });
+  // Register representative tools from each suite (the raw makeAgent registry
+  // only has `add` by default).
+  for (const def of [
+    { name: 'edit_file', description: 'edit a file', handler: async () => 'ok' },
+    { name: 'shell_spawn', description: 'spawn a background process', handler: async () => 'ok' },
+    { name: 'code_validate', description: 'validate code', handler: async () => 'ok' },
+    { name: 'package_info', description: 'package metadata', handler: async () => 'ok' },
+    { name: 'delete_file', description: 'delete a file', handler: async () => 'ok', requiresApproval: true },
+  ]) {
+    agent.tools.register(def);
+  }
+  const { done, text } = feedLines(agent, ['/tools', '/exit']);
+  await done;
+  const out = text();
+  assert.match(out, /edit_file/);
+  assert.match(out, /shell_spawn/);
+  assert.match(out, /code_validate/);
+  assert.match(out, /package_info/);
+  assert.match(out, /delete_file \(approval\)/, 'approval-gated tools are marked');
+});
+
 test('REPL: tool-use turns work and the scratchpad shows the step trail', async () => {
   const agent = makeAgent({
     script: [

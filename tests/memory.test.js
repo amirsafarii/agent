@@ -248,3 +248,56 @@ test('SCRAPPYAI_MEMORY_ENABLED=false disables memory entirely', async () => {
     delete process.env.SCRAPPYAI_MEMORY_ENABLED;
   }
 });
+
+test('fact extractor falls back to local patterns when the model call fails or returns nothing', async () => {
+  const brokenClient = {
+    async chat() {
+      throw new Error('model unreachable');
+    },
+  };
+  const memory = createMemory({ client: brokenClient });
+  const result = await memory.extractor.extractFromTurn({
+    userId: 'u1', sessionId: 's1', userMessage: 'by the way, my name is Sara and I live in Tehran',
+  });
+  assert.equal(result.checked, true);
+  assert.equal(result.factsPromoted, 2, 'name + city recovered without any model call');
+  const facts = await memory.memoryManager.longTerm.getConfirmed({ userId: 'u1', limit: 10 });
+  const byKey = Object.fromEntries(facts.map((f) => [f.key, f.value]));
+  assert.match(byKey.user_name, /Sara/);
+  assert.match(byKey.user_city, /Tehran/);
+  assert.equal(facts.every((f) => f.source === 'explicit' && f.confidence === 1), true, 'local facts are explicit, confidence 1');
+});
+
+test('memory between turns: injected [memory] reaches the model via the reasoner (turn-memory fix)', async () => {
+  const memory = freshMemory();
+  const { memoryManager, extractor } = memory;
+  await memoryManager.longTerm.upsertByKey({
+    userId: 'u1', key: 'user_name', value: "The user's name is Amir.", source: 'explicit', confidence: 1,
+  });
+
+  // The REAL createReasoner — this is what the agent ships with. The bug
+  // being fixed: wireMemory injected the [memory] system message into the
+  // ContextWindow, but the reasoner's native history never carried it to
+  // the provider, so "memory between turns" silently did nothing.
+  const seen = [];
+  const client = {
+    async chat({ messages }) {
+      seen.push(messages);
+      return { type: 'final', content: 'got it' };
+    },
+  };
+  const { createReasoner } = await import('../src/reasoner.js');
+  const reasoner = createReasoner({ client, systemPrompt: 'sys' });
+  const tools = new ToolRegistry();
+  tools.register({ name: 'noop', description: 'x', handler: async () => 'ok' });
+  const context = new ContextWindow({ maxTokens: 8000 });
+  const loop = new AgentLoop({ context, tools, reasoner });
+  wireMemory(loop, { memoryManager, extractor, userId: 'u1', sessionId: 's1' });
+
+  await loop.run('what do you remember about me?');
+
+  const lastRequest = seen[seen.length - 1];
+  const memoryMsg = lastRequest.find((m) => m.role === 'system' && m.content.includes('[memory]'));
+  assert.ok(memoryMsg, '[memory] block reached the provider request');
+  assert.match(memoryMsg.content, /user_name|name is Amir/);
+});

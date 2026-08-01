@@ -21,9 +21,12 @@ import { ContextWindow } from './context.js';
 import { ToolRegistry } from './tools.js';
 import { createReasoner } from './reasoner.js';
 import { createNineRouterClient } from './clients/9router.js';
-import { createShellTool } from './tools/shell.js';
+import { createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool } from './tools/shell.js';
+import { createFilesystemTools } from './tools/filesystem.js';
 import { createFileTools } from './tools/files.js';
 import { createWebSearchTool } from './tools/search.js';
+import { createCodeTools } from './tools/code.js';
+import { createPackageTools } from './tools/package.js';
 import { runRepl } from './repl.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory-integration.js';
@@ -50,9 +53,40 @@ const DEFAULT_SYSTEM_PROMPT = [
   '  already confirmed about this user/project and relevant past turns or ',
   '  episodes. Treat it as ground truth you already know - use it, do not ',
   '  re-ask for it, and never contradict a confirmed fact without saying so.',
-  '- Be direct and concrete. State what you did and what remains; do not ',
+  '',
+  'Efficiency and latency rules:',
+  '- Cheapest sufficient tool first. If a web_search snippet already contains ',
+  '  enough to answer, STOP there - do not call heavier tools (fetch/curl, ',
+  '  full file reads, package installs) for data you already have.',
+  '- Never call a tool twice for the same data, and never repeat a call whose ',
+  '  result you can see failed with the same arguments. Repeating identical or ',
+  '  near-identical calls is a bug, not persistence.',
+  '- Fallback Rule: when a tool fails with a network error, timeout, or any ',
+  '  transport-level failure (HTTP errors, DNS, connection refused), do NOT ',
+  '  retry that call and do NOT burn steps on it - pivot immediately: rely on ',
+  '  web_search results or answer from what you already know. Your step budget ',
+  '  is finite; each step must add new information.',
+  '- Limit total calls per tool: staying on one tool (endless search variants, ',
+  '  repeated installs) is misuse. Prefer the file tools for local data and the ',
+  '  web tools for remote data, and combine results instead of re-fetching.',
+  '',
+  'Toolset: file tools (read/write/edit/list/search/mkdir/move/copy/delete, all ',
+  'confined to the sandbox root), shell tools (exec/spawn/kill/which), code tools ',
+  '(run/test/validate), package tools (npm/install/package_info), and web_search. ',
+  'Destructive actions (delete_file, shell_kill) wait for human approval.',
+  '',
+  'Be direct and concrete. State what you did and what remains; do not ',
   '  narrate your own reasoning process or pad answers with filler.',
 ].join('\n');
+
+/** Parse SCRAPPYAI_REQUIRE_APPROVAL ("tool1,tool2" or "*") into requireApprovalFor. */
+function parseApprovalEnv() {
+  const raw = process.env.SCRAPPYAI_REQUIRE_APPROVAL;
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === '*') return '*';
+  return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+}
 
 /**
  * Resolve the system prompt to use, in priority order:
@@ -88,23 +122,39 @@ export function loadSystemPrompt(override) {
 }
 
 /**
- * Register the default tool set (shell, read_file, write_file, web_search)
- * on a ToolRegistry.
+ * Register the default tool set on a ToolRegistry:
+ *   filesystem: read_file, write_file, edit_file, list_dir, search_files,
+ *               make_dir, move_file, copy_file, delete_file (sandboxed)
+ *   shell:      shell (exec), shell_spawn, shell_kill, shell_which
+ *   code:       code_run, code_test, code_validate
+ *   package:    npm, package_install, package_info
+ *   web:        web_search
  * @param {Object} [opts]
  * @param {import('./tools.js').ToolRegistry} [opts.registry] reuse an existing registry instead of creating one
- * @param {string} [opts.filesRoot] sandbox root for read_file/write_file, default process.env.SCRAPPYAI_FILES_ROOT || cwd
+ * @param {string} [opts.filesRoot] sandbox root for all file/shell/code/package tools,
+ *        default process.env.SCRAPPYAI_FILES_ROOT || cwd
  * @param {string} [opts.shellCwd]
  * @returns {import('./tools.js').ToolRegistry}
  */
 export function createDefaultToolRegistry(opts = {}) {
   const registry = opts.registry || new ToolRegistry();
   const filesRoot = opts.filesRoot || process.env.SCRAPPYAI_FILES_ROOT || process.cwd();
+  const shellOpts = { cwd: opts.shellCwd, sandboxRoot: filesRoot };
 
-  registry.register(createShellTool({ cwd: opts.shellCwd }));
+  // filesystem suite (9 tools, incl. read_file/write_file)
+  for (const def of createFilesystemTools({ rootDir: filesRoot })) registry.register(def);
 
-  const { readTool, writeTool } = createFileTools({ rootDir: filesRoot });
-  registry.register(readTool);
-  registry.register(writeTool);
+  // shell suite (4 tools)
+  registry.register(createShellTool(shellOpts));
+  registry.register(createShellSpawnTool(shellOpts));
+  registry.register(createShellKillTool());
+  registry.register(createShellWhichTool());
+
+  // code suite (3 tools)
+  for (const def of createCodeTools({ rootDir: filesRoot })) registry.register(def);
+
+  // package suite (3 tools)
+  for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
 
   registry.register(createWebSearchTool());
 
@@ -153,12 +203,24 @@ export function buildAgent(opts = {}) {
   // this loop's CheckpointManager — so all three line up under the same id.
   const sessionId = opts.sessionId || process.env.SCRAPPYAI_SESSION_ID || `session_${Date.now()}_${randomUUID().slice(0, 8)}`;
 
+  // Step budget: SCRAPPYAI_MAX_STEPS sets the base; SCRAPPYAI_ADAPTIVE_MAX_STEPS
+  // (default on) lets the loop grow the budget up to SCRAPPYAI_MAX_STEPS_MAX
+  // while the run keeps producing progress, so complex tasks aren't cut short
+  // by a fixed ceiling. maxToolCallsPerTool caps flailing on one tool.
+  const maxSteps = Number(process.env.SCRAPPYAI_MAX_STEPS) || 12;
+  const adaptiveEnabled = String(process.env.SCRAPPYAI_ADAPTIVE_MAX_STEPS).toLowerCase() !== 'false';
+  const adaptiveMax = Number(process.env.SCRAPPYAI_MAX_STEPS_MAX) || maxSteps * 4;
+  const maxToolCallsPerTool = Number(process.env.SCRAPPYAI_MAX_TOOL_CALLS_PER_TOOL) || 8;
+
   const agent = new AgentLoop({
     context,
     tools,
     reasoner,
+    maxSteps,
+    adaptiveMaxSteps: adaptiveEnabled ? { max: adaptiveMax, growthFactor: 2 } : false,
+    maxToolCallsPerTool,
     onEvent: opts.onEvent,
-    requireApprovalFor: opts.requireApprovalFor,
+    requireApprovalFor: opts.requireApprovalFor ?? parseApprovalEnv(),
     onToolApproval: opts.onToolApproval,
     lifecycleHooks: opts.lifecycleHooks,
     checkpointDir: opts.checkpointDir ?? (process.env.SCRAPPYAI_CHECKPOINT_DIR

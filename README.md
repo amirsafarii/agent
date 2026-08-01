@@ -43,7 +43,7 @@ tests/
 ```
 npm test
 ```
-(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **103 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
+(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **140 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
 
 ## Wiring it together
 
@@ -139,13 +139,87 @@ on `src/clients/9router.js` into one `AgentLoop`, and runs a single prompt from 
 `buildAgent()` / `createDefaultToolRegistry()` instead if you want to embed ScrappyAi in another
 program (e.g. a Slack bot, a CLI with a REPL, a server).
 
-## Tools registered by default (`src/tools/`)
+## Tools registered by default (`src/tools/`) — 20 tools in 5 suites
 
-| Tool | File | Notes |
-|---|---|---|
-| `shell` | `tools/shell.js` | Runs a command via `execa`, **not** through `/bin/sh` unless `useShell:true` is passed — so `&&`/`|`/`>` are literal args by default. Denylist (`rm`, `shutdown`, `reboot`, `mkfs`, `dd`), optional allowlist, per-call timeout, stdout/stderr truncation, never throws on a non-zero exit (reports `exitCode` instead). |
-| `read_file` / `write_file` | `tools/files.js` | Confined to a sandbox root (`SCRAPPYAI_FILES_ROOT`, default cwd) — `../` traversal and absolute paths outside the root are rejected. `write_file` creates parent dirs and enforces a max content size. |
-| `web_search` | `tools/search.js` | Calls the SearXNG JSON API (`SEARXNG_BASE_URL`, defaults to the shared instance at `searxng-production-a06a.up.railway.app`). Exposes all the documented params: `q` (required), `format`, `categories`, `engines`, `language`, `pageno`, `time_range`, `safesearch`. Result list is capped (default 8) to protect the context budget. |
+**filesystem** (`tools/filesystem.js`) — all confined to the sandbox root
+(`SCRAPPYAI_FILES_ROOT`, default cwd); `../` traversal and absolute paths
+outside the root are rejected before any fs call:
+
+| Tool | Notes |
+|---|---|
+| `read_file` | Read a UTF-8 text file (capped at 20k chars, `truncated` flag). |
+| `write_file` | Create/overwrite/append (capped at 200k chars, creates parents). |
+| `edit_file` | Targeted find/replace — literal or `useRegex`, `replace_all`, fails with `NOT_FOUND` instead of silently doing nothing. |
+| `list_dir` | Flat or `recursive` (depth- and entry-capped), hidden excluded by default. |
+| `search_files` | Glob patterns (`**/*.js`, `*.md`), optional content substring filter, result cap. |
+| `make_dir` | `mkdir -p`. |
+| `move_file` | Rename/move, cross-device safe (copy+unlink fallback). |
+| `copy_file` | File or whole tree copy. |
+| `delete_file` | Deletes files/dirs — **approval-gated** (`requiresApproval:true`), refuses the sandbox root and non-recursive dirs. |
+
+**shell** (`tools/shell.js`):
+
+| Tool | Notes |
+|---|---|
+| `shell` | Runs a command via `execa`, **not** through `/bin/sh` unless `useShell:true` — `&&`/`|`/`>` are literal args by default. Denylist (`rm`, `shutdown`, `reboot`, `mkfs`, `dd`), optional allowlist, `cwd` is checked against the sandbox root, per-call timeout, output truncation, never throws on non-zero exit. |
+| `shell_spawn` | Background process (detached, stdio ignored), returns the pid immediately; tracked for later `shell_kill`. |
+| `shell_kill` | Kill by pid (default SIGTERM); only pids `shell_spawn` started unless `force:true` — **approval-gated**. |
+| `shell_which` | PATH resolution for a binary (no subprocess). |
+
+**code** (`tools/code.js`):
+
+| Tool | Notes |
+|---|---|
+| `code_run` | Executes a file or inline code with the right interpreter (`.js/.mjs/.cjs/.ts → node`, `.py → python3`, `.sh → bash`); bounded timeout, truncated output, exit codes reported not thrown. |
+| `code_test` | `command` mode, single-file mode (`node --test` / `pytest`), or the package.json `test` script / bare `node --test`. |
+| `code_validate` | Static checks only — `node --check`, JSON parse, `py_compile`; invalid code never runs. |
+
+**package** (`tools/package.js`):
+
+| Tool | Notes |
+|---|---|
+| `npm` | Any npm command inside the sandbox (`run build`, `ls`, ...), 120s timeout. |
+| `package_install` | `npm install` / `npm install <pkgs>` with `dev`/`force` flags. |
+| `package_info` | Offline metadata: the project's package.json or an installed package resolved from cwd (no registry call). |
+
+**web**: `web_search` (`tools/search.js`) — SearXNG JSON API (`SEARXNG_BASE_URL`), all documented params, results capped (default 8).
+
+### Sandbox
+
+Everything file-shaped (filesystem, code, package, shell `cwd`) is confined
+to one root — `SCRAPPYAI_FILES_ROOT` (defaults to the working directory).
+`read_file`/`write_file` keep their legacy names; the full suite lives in
+`tools/filesystem.js`. Destructive tools (`delete_file`, `shell_kill`) are
+approval-gated out of the box; add more via `SCRAPPYAI_REQUIRE_APPROVAL`
+(comma list or `*`) or `buildAgent({ requireApprovalFor })`.
+
+### Agent-logic safeguards (loop.js)
+
+- **Adaptive step budget** — `maxSteps` is a base, not a ceiling: with
+  `adaptiveMaxSteps` (on by default in `buildAgent()`), the budget grows
+  (doubling, up to `SCRAPPYAI_MAX_STEPS_MAX`, default 48) while the run
+  keeps producing progress, so a 30-step task isn't cut short. Per-call
+  override: `agent.run(input, { maxSteps })`. Disable with
+  `SCRAPPYAI_ADAPTIVE_MAX_STEPS=false`.
+- **Tool-overuse guard** — `maxToolCallsPerTool` (default 8) stops a run
+  when one tool is called too many times, whatever the args — endless
+  search variants get capped, legitimate multi-step work doesn't.
+- **Similar-call warning** — near-duplicate calls (same tool, args equal
+  after key-order normalization, non-consecutive) append a `[loop guard]`
+  notice so the reasoner can pivot instead of repeating itself.
+- **Fail-fast retries** — only generic execution errors are retried now;
+  timeouts and network-shaped failures (`REQUEST_FAILED`, `HTTP_ERROR`,
+  `ENOTFOUND`, `ETIMEDOUT`, ...) fail on the first attempt so the agent
+  pivots immediately (see the Fallback Rule in the system prompt).
+- **Stuck-loop detection** (unchanged) stops identical consecutive calls.
+
+### System prompt rules (updated)
+
+The built-in `DEFAULT_SYSTEM_PROMPT` now encodes the efficiency contract:
+cheapest-sufficient-tool-first, **snippet sufficiency** (a web_search
+snippet that answers is enough — no fetch/curl), the **Fallback Rule**
+(network error/timeout → don't retry, rely on web_search or prior data),
+and no repeated calls for the same data.
 
 ## `clients/9router.js`
 
@@ -195,6 +269,8 @@ ok, noted.
 scrappyai> what's my name?
 your name is yysafari86.
 scrappyai> /history      # dump exactly what's being sent to the model
+scrappyai> /tools        # list the 20 registered tools
+scrappyai> /scratchpad   # full Thought/Action/Observation trail
 scrappyai> /reset        # wipe memory, keep the system prompt, keep going
 scrappyai> /exit
 ```
@@ -383,14 +459,34 @@ Covered by `tests/streaming.test.js` (10 tests) plus the SSE-recovery tests in
 
 ## Status
 
-Implemented and tested (**103 tests, `node --test`, all green**): `AgentLoop` (state machine,
-stop-condition engine, checkpoints/pause/resume, tool-approval gate, lifecycle hooks),
-`ToolRegistry`, `ContextWindow`, `createReasoner`, the `shell`/`read_file`/`write_file`/
-`web_search` tools, the `9router` client (chat + chatStream), the seven-layer memory system
-with in-process auto-fallback, checkpoint/session-log/trace/REPL layers, and `index.js`
-wiring. `shell` and `files` tests exercise real subprocess/filesystem behavior; `search` and
-`9router` tests stub `fetch` (no live network dependency in the suite, even though the
-SearXNG endpoint was manually verified live and returns real results).
+Implemented and tested (**140 tests, `node --test`, all green**): `AgentLoop` (state machine,
+stop-condition engine, adaptive step budget, tool-overuse + similar-call guards,
+checkpoints/pause/resume, tool-approval gate, lifecycle hooks), `ToolRegistry`, `ContextWindow`,
+`createReasoner` (with the turn-memory system-message sync), the **20-tool default registry**
+(filesystem suite, shell exec/spawn/kill/which, code run/test/validate, package npm/install/
+package_info, web_search), the `9router` client (chat + chatStream), the seven-layer memory
+system with in-process auto-fallback + local-pattern fact extraction, checkpoint/session-log/
+trace/REPL layers, and `index.js` wiring. `shell`/`files`/`code` tests exercise real
+subprocess/filesystem behavior; `search` and `9router` tests stub `fetch` (no live network
+dependency in the suite, even though the SearXNG endpoint was manually verified live and
+returns real results).
+
+## Memory between turns — what was fixed
+
+Two real bugs made "turn memory" silently fail:
+
+1. **The `[memory]` system message never reached the model.** `wireMemory()` appends the
+   injected facts to `ContextWindow`, but `createReasoner()`'s native history only mirrored
+   user/assistant/tool turns — so the provider never saw the memory block. The reasoner now
+   syncs dynamic system messages from the rendered context into its native history on every
+   call: the current `[memory]` block replaces any older one (facts change), other system
+   messages (`[loop guard]`, `[context summary]`) are added once, deduped.
+2. **Fact extraction depended entirely on a model call.** If the LLM was down or returned
+   nothing, nothing was remembered. The extractor now falls back to deterministic local
+   patterns (name/email/phone/city/role/preference/birthday) — "my name is X" survives even
+   with a broken model. `wireMemory()` also wraps `resume()`/`resumeWithApproval()` now, so
+   approval-continued runs still get injection + recording, and memory events land in the
+   session log like every other event.
 
 ## Roadmap
 

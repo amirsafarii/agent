@@ -47,6 +47,75 @@ function localTriggerMatches(text) {
   return TRIGGER_PATTERNS.some(p => p.test(text));
 }
 
+/**
+ * Deterministic, model-free extraction of the most common durable facts.
+ * Only consulted when the trigger regexes matched AND the model call failed
+ * or returned nothing — plain chit-chat never reaches this (the trigger
+ * gate still applies). Facts are always source:'explicit', confidence 1:
+ * the user is stating them directly, and no model is second-guessing.
+ */
+const LOCAL_FACT_PATTERNS = [
+  {
+    key: 'user_name',
+    re: /\bmy name is\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF .'-]{1,60})/i,
+    value: (m) => `The user's name is ${m[1].trim()}.`,
+    importance: 0.9,
+  },
+  {
+    key: 'user_email',
+    re: /\bmy email is\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i,
+    value: (m) => `The user's email is ${m[1].trim()}.`,
+    importance: 0.8,
+  },
+  {
+    key: 'user_phone',
+    re: /\bmy phone number is\s+([+\d][\d\s-]{6,20})/i,
+    value: (m) => `The user's phone number is ${m[1].trim()}.`,
+    importance: 0.8,
+  },
+  {
+    key: 'user_city',
+    re: /\bi live in\s+([A-Za-z\u0600-\u06FF][^.,!?\n]{1,60})/i,
+    value: (m) => `The user lives in ${m[1].trim()}.`,
+    importance: 0.7,
+  },
+  {
+    key: 'user_role',
+    re: /\bi work (?:as|at)\s+(?:an? |a )?([^.,!?\n]{2,60})/i,
+    value: (m) => `The user works as ${m[1].trim()}.`,
+    importance: 0.8,
+  },
+  {
+    key: 'user_preference',
+    re: /\bi prefer\s+([^.,!?\n]{2,60})/i,
+    value: (m) => `The user prefers ${m[1].trim()}.`,
+    importance: 0.7,
+  },
+  {
+    key: 'user_birthday',
+    re: /\bmy birthday is\s+([^.,!?\n]{3,40})/i,
+    value: (m) => `The user's birthday is ${m[1].trim()}.`,
+    importance: 0.7,
+  },
+];
+
+function localExtractFacts(text) {
+  const facts = [];
+  for (const p of LOCAL_FACT_PATTERNS) {
+    const m = p.re.exec(text);
+    if (!m) continue;
+    facts.push({
+      key: p.key,
+      value: p.value(m),
+      tags: ['identity'],
+      importance: p.importance,
+      confidence: 1,
+      source: 'explicit',
+    });
+  }
+  return facts;
+}
+
 function safeParseFactArray(raw) {
   if (!raw || typeof raw !== 'string') return [];
   const trimmed = raw.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
@@ -88,6 +157,7 @@ export class MemoryExtractor {
     }
 
     let facts = [];
+    let modelOk = true;
     try {
       const provider = this.providerRegistry.getDefault();
       const result = await provider.generate({
@@ -100,9 +170,22 @@ export class MemoryExtractor {
         ],
       });
       facts = safeParseFactArray(result.message?.content);
+      if (facts.length === 0) modelOk = false; // nothing durable per the model
     } catch (err) {
-      log.warn({ err: err.message, userId, sessionId }, 'Memory extraction model call failed — skipping this turn');
-      return { checked: true, factsPromoted: 0, facts: [] };
+      log.warn({ err: err.message, userId, sessionId }, 'Memory extraction model call failed — falling back to local patterns');
+      modelOk = false;
+    }
+
+    // --- Local fallback: the model call failed or found nothing, but the
+    // trigger regexes matched. Extract the common durable facts directly
+    // with deterministic patterns (name/email/phone/city/role/preference),
+    // so "my name is X" survives even with a broken/absent model — memory
+    // between sessions must not depend on one upstream call.
+    if (!modelOk) {
+      facts = localExtractFacts(text);
+      if (facts.length > 0) {
+        log.info({ userId, sessionId, keys: facts.map(f => f.key) }, 'Local pattern extraction recovered durable facts');
+      }
     }
 
     let promoted = 0;

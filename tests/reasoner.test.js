@@ -182,11 +182,98 @@ test('seeds native history from rendered context on first call when empty', asyn
     ],
     []
   );
-  // System + tool_result roles are not part of the native chat history.
+  // User/assistant roles are seeded; dynamic system messages are synced into
+  // native history too (turn-memory fix) — tool_result stays out (the loop
+  // mirrors those via addToolResult with the proper tool_call_id).
   assert.deepEqual(seen[0], [
+    { role: 'system', content: 'sys' },
     { role: 'user', content: 'u1' },
     { role: 'assistant', content: 'a1' },
   ]);
+});
+
+test('turn memory: dynamic [memory] system messages are synced to the model and refreshed', async () => {
+  const seen = [];
+  const client = {
+    chat: async ({ messages }) => {
+      seen.push(messages.map((m) => ({ role: m.role, content: m.content })));
+      return { type: 'final', content: 'ok' };
+    },
+  };
+  const reasoner = createReasoner({ client });
+
+  // Turn 1: wireMemory injected a [memory] block into the rendered context.
+  await reasoner(
+    [
+      { role: 'system', content: '[memory]\n- The user\'s name is Amir.' },
+      { role: 'user', content: 'hi' },
+    ],
+    []
+  );
+  assert.equal(seen[0].filter((m) => m.role === 'system' && m.content.includes('[memory]')).length, 1, 'memory block reaches the provider');
+
+  // Turn 2: the memory block changed (a new fact was added) — the OLD block
+  // must be replaced, not stacked.
+  await reasoner(
+    [
+      { role: 'system', content: '[memory]\n- The user\'s name is Amir.\n- The user prefers Python.' },
+      { role: 'user', content: 'what do you know?' },
+    ],
+    []
+  );
+  const memoryInSecond = seen[1].filter((m) => m.role === 'system' && m.content.includes('[memory]'));
+  assert.equal(memoryInSecond.length, 1, 'old memory block replaced by the current one');
+  assert.match(memoryInSecond[0].content, /prefers Python/);
+
+  // Non-memory system messages (e.g. [loop guard]) are synced once, deduped.
+  await reasoner(
+    [
+      { role: 'system', content: '[loop guard] something happened' },
+      { role: 'user', content: 'again' },
+    ],
+    []
+  );
+  assert.equal(seen[2].filter((m) => m.role === 'system' && m.content.includes('[loop guard]')).length, 1);
+  await reasoner(
+    [
+      { role: 'system', content: '[loop guard] something happened' },
+      { role: 'user', content: 'third' },
+    ],
+    []
+  );
+  const guardCount = seen[3].filter((m) => m.role === 'system' && m.content.includes('[loop guard]')).length;
+  assert.equal(guardCount, 1, 'identical guard message is not duplicated');
+});
+
+test('turn memory: the persistent systemPrompt is never duplicated by the sync — even when it mentions "[memory]"', async () => {
+  const seen = [];
+  const client = {
+    chat: async ({ messages }) => {
+      seen.push(messages);
+      return { type: 'final', content: 'ok' };
+    },
+  };
+  // The real built-in prompt mentions "[memory]" in its rules — a naive
+  // includes() match would treat the prompt itself as the memory block.
+  const systemPrompt =
+    'You are ScrappyAi. A "[memory]" system message, when present, lists facts you already know. Be terse.';
+  const reasoner = createReasoner({ client, systemPrompt });
+
+  await reasoner(
+    [
+      { role: 'system', content: systemPrompt }, // rendered context includes the prompt
+      { role: 'system', content: '[memory]\n- The user\'s name is Amir.' },
+      { role: 'user', content: 'hi' },
+    ],
+    []
+  );
+
+  const req = seen[0];
+  const promptCopies = req.filter((m) => m.role === 'system' && m.content === systemPrompt);
+  assert.equal(promptCopies.length, 0, 'history has no prompt copy — the client sends it separately');
+  const memoryBlocks = req.filter((m) => m.role === 'system' && m.content.startsWith('[memory]'));
+  assert.equal(memoryBlocks.length, 1, 'the real [memory] block is synced');
+  assert.match(memoryBlocks[0].content, /name is Amir/);
 });
 
 test('createScriptedClient plays responses in order and cycles at the end', async () => {

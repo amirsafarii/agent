@@ -115,6 +115,38 @@ export function createReasoner({ client, systemPrompt, maxRetries = DEFAULT_MAX_
         .map((m) => ({ role: m.role, content: m.content }));
     }
 
+    // --- Turn-memory fix: sync DYNAMIC system messages into native history --
+    // ContextWindow carries dynamic system messages the model must see —
+    // the `[memory]` block injected by wireMemory, `[loop guard]` notices,
+    // `[context summary]` after compaction. This module's own history only
+    // mirrors user/assistant/tool turns, so without this sync those messages
+    // would be invisible to the provider and "remember between turns" would
+    // silently break. Rules:
+    //   - the persistent `systemPrompt` is EXCLUDED (it is already sent by
+    //     the client on every request; syncing it would duplicate it — and
+    //     because the prompt itself may mention "[memory]", a naive
+    //     `content.includes('[memory]')` match would grab the prompt instead
+    //     of the real memory block)
+    //   - the CURRENT `[memory]` block (identified by STARTING with
+    //     "[memory]") replaces any older `[memory]` block — facts may have
+    //     changed, duplicates would waste tokens
+    //   - other new system messages are appended once (deduped by content)
+    if (Array.isArray(renderedContext)) {
+      const dynamicSystem = renderedContext.filter((m) => m.role === 'system' && m.content !== systemPrompt);
+      const memoryBlocks = dynamicSystem.filter((m) => /^\[memory\]/.test(m.content));
+      if (memoryBlocks.length > 0) {
+        history = history.filter((h) => !(h.role === 'system' && /^\[memory\]/.test(h.content)));
+        const insertAt = history.findIndex((h) => h.role !== 'system');
+        history.splice(insertAt === -1 ? history.length : insertAt, 0, ...memoryBlocks.map((m) => ({ role: 'system', content: m.content })));
+      }
+      for (const m of dynamicSystem) {
+        if (/^\[memory\]/.test(m.content)) continue;
+        if (history.some((h) => h.role === 'system' && h.content === m.content)) continue;
+        const insertAt = history.findIndex((h) => h.role !== 'system');
+        history.splice(insertAt === -1 ? history.length : insertAt, 0, { role: 'system', content: m.content });
+      }
+    }
+
     const useStream = stream && typeof client.chatStream === 'function';
 
     let lastErr;

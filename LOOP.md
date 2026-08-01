@@ -49,6 +49,7 @@ type LoopResult = {
   status: 'final' | 'need_clarification' | 'error' | 'max_steps' | 'aborted' | 'stopped' | 'paused' | 'awaiting_tool_approval';
   reason: TerminationReason | string;   // 'string' فقط وقتی status === 'stopped' (custom/named stop condition)
   steps: number;                        // چند step واقعاً اجرا شد (تا این run/resume، نه فقط این تک‌فراخوانی)
+  budget: number;                       // بودجه‌ی استپ مؤثر (با adaptiveMaxSteps رشد می‌کند)
   elapsedMs: number;                    // زمان این فراخوانی run()/resume() به میلی‌ثانیه (نه کل عمر run اگر resume شده)
   stepMemory: StepRecord[];             // رونوشت کامل و ساخت‌یافته — بخش ۵
   state: LoopState;                     // state نهایی state machine در همین لحظه — بخش ۱۳
@@ -73,6 +74,7 @@ type LoopResult = {
 | `max_tokens_exceeded` | context بعد از compaction هنوز over-budget است | مقایسه‌ی `usedTokens` با `maxTokens` |
 | `stuck_loop_detected` | همان `tool+args` دقیقاً `maxRepeatedToolCalls` بار پشت‌سرهم | fingerprint matching |
 | `tool_failure_exhausted` | یک ابزار `maxConsecutiveToolExhaustion` بار پشت‌سرهم همه‌ی retry-هایش را باخت | شمارنده‌ی consecutive exhaustion |
+| `tool_overuse` | یک ابزار بیش از `maxToolCallsPerTool` بار در یک run صدا زده شد (حتی با آرگومان‌های متفاوت) | گارد ضد «Tool Misuse» — بخش ۲۲ |
 | `aborted_by_signal` | `AbortSignal` بیرونی فعال شد | چک `signal.aborted` |
 | `think_phase_error` | خود reasoner throw کرد (نه خطای validation) | catch در فاز THINK |
 | `invalid_action` | reasoner یک Action نامعتبر برگرداند (schema mismatch) | `_validateAction()` |
@@ -121,10 +123,16 @@ type RetryPolicy = {
 پیش‌فرض حلقه (`toolRetry` در constructor):
 ```js
 { retries: 2, backoffMs: 250, factor: 2,
-  retryableCodes: ['TOOL_TIMEOUT', 'TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR', 'TIMEOUT'] }
+  retryableCodes: ['TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR'] }
 ```
 
-نکته‌ی مهم: کدهایی مثل `VALIDATION_ERROR` و `UNKNOWN_TOOL` **هرگز** retry نمی‌شوند — چون یک retry نمی‌تواند یک call ساختاریافته‌ی غلط را درست کند؛ تلاش اول شکست می‌خورد و فوراً به فاز observe می‌رود (fail-fast).
+نکته‌ی مهم ۱: کدهایی مثل `VALIDATION_ERROR` و `UNKNOWN_TOOL` **هرگز** retry نمی‌شوند — چون یک retry نمی‌تواند یک call ساختاریافته‌ی غلط را درست کند؛ تلاش اول شکست می‌خورد و فوراً به فاز observe می‌رود (fail-fast).
+
+نکته‌ی مهم ۲ (قانون Fallback): timeout ها (`TOOL_TIMEOUT`) و خطاهای شبکه‌ای (`REQUEST_FAILED`, `HTTP_ERROR`,
+`BAD_JSON`, `ENOTFOUND`, `ECONNREFUSED`, `ETIMEDOUT`, `STREAM_FAILED`, کدهای DNS) هم **fail-fast** هستند —
+دیگر در پیش‌فرض retry نمی‌شوند. یک endpoint مرده با retry زنده نمی‌شود و فقط latency و توکن می‌سوزاند؛
+reasoner باید بلافاصله به ابزار دیگری (مثلاً `web_search`) یا پاسخ از دانش خودش بپیچد. این قانون در
+پرامپت سیستم هم قید شده است.
 
 هر `action.retry` می‌تواند به‌صورت per-call این پالیسی را override کند (مثلاً یک ابزار حساس را retry نکن: `{ retry: { retries: 0 } }`).
 
@@ -275,6 +283,8 @@ new AgentLoop({
   maxTaskTimeoutMs?: number = 300000,
   toolRetry?: RetryPolicy,             // پیش‌فرض بخش ۴
   maxConsecutiveToolExhaustion?: number = 2,
+  maxToolCallsPerTool?: number = 8,          // گارد Tool Misuse — بخش ۲۲
+  adaptiveMaxSteps?: { max: number, growthFactor?: number } | false = false,  // بودجه‌ی استپ تطبیقی — بخش ۲۲
   compressMaxChars?: number = 1500,
   compressToolResult?: (result: ToolResult, opts: {maxChars}) => ToolResult,
   stopConditions?: StopCondition[] = [],          // legacy، هنوز پشتیبانی می‌شود — بخش ۱۲
@@ -291,7 +301,7 @@ new AgentLoop({
 ## `run()` / `resume()` / `resumeWithApproval()` — schema کامل
 
 ```ts
-run(userInput: string, runOpts?: { signal?: AbortSignal }) => Promise<LoopResult>
+run(userInput: string, runOpts?: { signal?: AbortSignal, maxSteps?: number }) => Promise<LoopResult>  // maxSteps: override per-call بودجه‌ی پایه
 
 resume(checkpoint: Checkpoint, runOpts?: { additionalInput?: string, signal?: AbortSignal }) => Promise<LoopResult>
 
@@ -459,6 +469,9 @@ type Checkpoint = {
   step: number;                      // آخرین step کامل‌شده (resume از step+1 شروع می‌کند)
   elapsedMs: number;                 // چند ms از بودجه‌ی maxTaskTimeoutMs مصرف شده (resume از همین‌جا ادامه می‌دهد)
   toolCallHistory: string[];         // fingerprint های اخیر، برای ادامه‌ی stuck-loop detection
+  toolCallCounts: Record<string, number>;   // شمارنده‌ی per-tool (گارد overuse) — ادامه‌ی resume
+  similarCallHistory: string[];      // پنجره‌ی هشدار الگوی تکراری
+  budget: number | null;             // بودجه‌ی استپ مؤثر (تطبیقی) — resume از همان‌جا ادامه می‌دهد
   stepMemory: StepRecord[];          // کل تاریخچه‌ی ساخت‌یافته تا این لحظه
   consecutiveToolExhaustion: number; // شمارنده‌ی error recovery (بخش ۴)
   context: ReturnType<ContextWindow['toJSON']>;  // کل ترنسکریپت context (messages + dropped + بودجه)
@@ -659,11 +672,62 @@ Streaming عمداً بیرون از `loop.js` پیاده شده تا قرارد
 
 
 
-## 21. شمارش نهایی تست‌ها
+## 22. بودجه‌ی استپ تطبیقی + گاردهای استفاده از ابزار
 
-همه‌ی فایل‌های تست با هم: **۱۰۳/۱۰۳ تست سبز** — شامل ۹ تست `loop-advanced`، ۸ تست
-`loop-checkpoint`، ۱۰ تست `loop-approval` (approval/checkpoint-manager/session-logger)،
-۱۳ تست `reasoner`، ۱۰ تست `9router`، ۱۳ تست `tools`، ۱۲ تست `memory`، ۱۰ تست `streaming`،
-۶ تست `logger`، ۸ تست `smoke` و ۴ تست `repl`. بدون شکستن هیچ‌کدام.
+### Adaptive step budget — «max_steps بر اساس کار لازم»
+
+یک سقف ثابت یا خیلی کم استپ‌ها را می‌برد یا توکن می‌سوزاند. حالا `maxSteps` فقط *پایه* است:
+
+- `adaptiveMaxSteps: { max, growthFactor = 2 }` — بودجه از `maxSteps` شروع می‌شود و تا `max` (پیش‌فرض
+  در `buildAgent()`: ۴۸) هر بار که یک step کامل شود و run هنوز به پایان نرسیده، دو برابر می‌شود
+  (`budget_extended` event + لاگ `run:budget_extended`). مسیرهای خطا (stuck/timeout/overuse) به این
+  نقطه نمی‌رسند، پس رشد فقط پاداش پیشرفت واقعی است.
+- `runOpts.maxSteps` — override per-call روی پایه.
+- `LoopResult.budget` و `checkpoint.budget` — بودجه‌ی مؤثر؛ resume از همان بودجه ادامه می‌دهد.
+- خاموش با `adaptiveMaxSteps: false` یا `SCRAPPYAI_ADAPTIVE_MAX_STEPS=false`.
+
+### گارد Tool Overuse (ضد «Tool Misuse»)
+
+`maxToolCallsPerTool` (پیش‌فرض ۸): شمارنده‌ی per-tool کل run (آرگومان‌ها مهم نیستند — همان ابزار با
+کوئری‌های بی‌پایان هم شمرده می‌شود). عبور از سقف → `status:'error'`, `reason:'tool_overuse'`,
+پیام `[loop guard]` در context، رویداد `tool_overuse`. شمارنده در checkpoint ذخیره و در resume
+بازیابی می‌شود.
+
+### هشدار Similar Call (الگوی تکراری)
+
+`_isSimilarCall()` — همان ابزار با آرگومان‌هایی که بعد از normalize (مرتب‌سازی کلیدها) یکسان‌اند،
+اگر در پنجره‌ی ۸ فراخوانی اخیر دیده شده باشند (به‌جز تکرار متوالیِ دقیق که مال گارد stuck-loop است):
+یک پیام `[loop guard]` به context اضافه و رویداد `similar_call` منتشر می‌شود — غیرترمینال؛ فقط به
+reasoner هشدار می‌دهد که داده را دارد و تکرار نکند.
+
+---
+
+## 23. حافظه بین turn ها — sync پیام‌های سیستمی در reasoner
+
+دو باگ واقعی باعث می‌شد «حافظه بین turn ها» بی‌صدا کار نکند:
+
+1. `wireMemory()` بلوک `[memory]` را به `ContextWindow` اضافه می‌کرد، اما `createReasoner()` فقط
+   پیام‌های user/assistant/tool را به history بومی‌اش mirror می‌کرد — پس مدل هرگز بلوک حافظه را
+   نمی‌دید. حالا reasoner در هر فراخوانی، پیام‌های سیستمیِ پویا را از context رندر شده sync می‌کند:
+   بلوک فعلی `[memory]` جایگزین بلوک قبلی می‌شود (فکت‌ها عوض می‌شوند؛ تکرار توکن نمی‌سوزاند) و
+   پیام‌های سیستمی دیگر (`[loop guard]`, `[context summary]`) یک بار (dedupe با content) اضافه می‌شوند.
+2. استخراج فکت فقط به یک model call وابسته بود؛ اگر مدل خطا می‌داد یا چیزی برنمی‌گرداند، هیچ‌چیز
+   به خاطر سپرده نمی‌شد. حالا `memory-extractor.js` وقتی trigger منطبق است و مدل خروجی نداشت، با
+   الگوهای محلی قطعی (name/email/phone/city/role/preference/birthday) فکت را با
+   `source:'explicit', confidence:1` استخراج می‌کند — «اسم من X است» حتی با مدل خراب هم ثبت می‌شود.
+
+ضمناً `wireMemory()` حالا `resume()`/`resumeWithApproval()` را هم wrap می‌کند (تزریق قبل، ثبت بعد)
+و رویدادهای حافظه را از طریق `agent.onEvent` جاری (شامل wrapper سشن‌لاگر) منتشر می‌کند تا در
+`events.jsonl` هم دیده شوند.
+
+---
+
+## 24. شمارش نهایی تست‌ها
+
+همه‌ی فایل‌های تست با هم: **۱۴۰/۱۴۰ تست سبز** — ۹ تست `loop-advanced`، ۸ تست `loop-checkpoint`،
+۱۰ تست `loop-approval`، ۱۵ تست `reasoner` (شامل sync حافظه و non-duplication پرامپت)، ۱۰ تست `9router`، ۱۳ تست `tools`، ۸ تست `loop-guards`
+(بودجه‌ی تطبیقی، overuse، similar-call)، ۹ تست `filesystem`، ۶ تست `shell-extra`، ۹ تست
+`code-package`، ۱۴ تست `memory` (شامل fallback محلی و fix حافظه بین turn)، ۱۰ تست `streaming`،
+۶ تست `logger`، ۸ تست `smoke` و ۵ تست `repl`. بدون شکستن هیچ‌کدام.
 
 اجرا: `npm test` (از ریشه‌ی `scrappyai`).

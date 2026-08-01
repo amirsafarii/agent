@@ -37,6 +37,7 @@ const HELP_TEXT = [
   '  /help        show this message',
   '  /history     dump the rendered context window sent to the model',
   '  /scratchpad  dump the Agent Scratchpad (full Thought/Action/Observation trail, not the compressed context)',
+  '  /tools       list the registered tools',
   '  /system      show the active system prompt',
   '  /reset       clear conversation memory (context + reasoner history), keep the system prompt',
   '  /approve     approve the tool call this session is currently awaiting approval for',
@@ -144,6 +145,13 @@ async function handleCommand(line, { agent, systemPrompt, output, session }) {
     case '/scratchpad':
       output.write(`${renderScratchpad(agent.getStepMemory())}\n`);
       return false;
+    case '/tools': {
+      const list = agent.tools.list();
+      output.write(
+        `${list.map((t) => `  ${t.name}${t.requiresApproval ? ' (approval)' : ''} — ${(t.description || '').split('\n')[0]}`).join('\n')}\n`
+      );
+      return false;
+    }
     case '/reset':
       agent.context.clear();
       if (typeof agent.reasoner.reset === 'function') agent.reasoner.reset();

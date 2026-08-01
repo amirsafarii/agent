@@ -50,6 +50,9 @@ export const LoopEvents = Object.freeze({
   TOOL_APPROVAL_REJECTED: 'tool_approval_rejected',
   LIFECYCLE_CREATED: 'lifecycle_created',
   LIFECYCLE_FAILED: 'lifecycle_failed',
+  TOOL_OVERUSE: 'tool_overuse',
+  SIMILAR_CALL: 'similar_call',
+  BUDGET_EXTENDED: 'budget_extended',
 });
 
 /**
@@ -233,6 +236,7 @@ export const TerminationReason = Object.freeze({
   MAX_TOKENS: 'max_tokens_exceeded',
   STUCK_LOOP: 'stuck_loop_detected',
   TOOL_FAILURE_EXHAUSTED: 'tool_failure_exhausted',
+  TOOL_OVERUSE: 'tool_overuse',
   ABORTED: 'aborted_by_signal',
   THINK_ERROR: 'think_phase_error',
   INVALID_ACTION: 'invalid_action',
@@ -247,16 +251,23 @@ export const ActionType = Object.freeze({
   NEED_CLARIFICATION: 'need_clarification',
 });
 
+// Deliberately narrow: only generic execution errors are retried. Timeouts
+// (TOOL_TIMEOUT) and network-shaped failures (REQUEST_FAILED / HTTP_ERROR /
+// BAD_JSON / ENOTFOUND / ECONNREFUSED / ETIMEDOUT / STREAM_FAILED / DNS
+// codes) fail fast so the reasoner can pivot immediately instead of burning
+// latency on a dead endpoint — see the "Fallback Rule" in the system prompt.
 const DEFAULT_TOOL_RETRY = Object.freeze({
   retries: 2,
   backoffMs: 250,
   factor: 2,
-  retryableCodes: ['TOOL_TIMEOUT', 'TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR', 'TIMEOUT'],
+  retryableCodes: ['TOOL_EXECUTION_ERROR', 'EXECUTION_ERROR'],
 });
 
 const DEFAULT_MAX_TASK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes wall clock per run()
 const DEFAULT_COMPRESS_MAX_CHARS = 1500;
 const DEFAULT_MAX_CONSECUTIVE_TOOL_EXHAUSTION = 2;
+const DEFAULT_MAX_TOOL_CALLS_PER_TOOL = 8; // hard per-run cap per tool name
+const DEFAULT_SIMILAR_WINDOW = 8; // how many recent tool calls to compare for similarity warnings
 
 export class LoopError extends Error {
   constructor(message, code = 'LOOP_ERROR') {
@@ -281,6 +292,14 @@ export class AgentLoop {
    * @param {number} [opts.toolRetry.factor=2]
    * @param {string[]} [opts.toolRetry.retryableCodes] tool error codes worth retrying; anything else fails fast.
    * @param {number} [opts.maxConsecutiveToolExhaustion=2] Stop the run if this many tool_calls in a row exhaust all retries.
+   * @param {number} [opts.maxToolCallsPerTool=8] Stop the run when a single tool has been called this many
+   *        times in one run (anti "tool misuse" / token-burn guard, independent of args — different queries
+   *        to the same tool count, so it caps flailing, not legitimate multi-step work).
+   * @param {Object|false} [opts.adaptiveMaxSteps=false] Grow the step budget while the run is still making
+   *        progress instead of stopping at the fixed `maxSteps` ceiling. Shape:
+   *        `{ max?: number, growthFactor?: number = 2 }` — the budget starts at `maxSteps` and doubles up to
+   *        `max` as completed steps keep producing (non-terminal) actions. Off unless you opt in.
+   *        A per-call override also exists: `runOpts.maxSteps`.
    * @param {number} [opts.compressMaxChars=1500] Tool result char budget written into ContextWindow (full result kept in step memory).
    * @param {Function} [opts.compressToolResult] Override compression: (result, {maxChars}) => compressedResult.
    * @param {Array<Function>} [opts.stopConditions] Legacy custom checks: (state) => reason string | null, run each
@@ -317,6 +336,8 @@ export class AgentLoop {
     maxTaskTimeoutMs = DEFAULT_MAX_TASK_TIMEOUT_MS,
     toolRetry = {},
     maxConsecutiveToolExhaustion = DEFAULT_MAX_CONSECUTIVE_TOOL_EXHAUSTION,
+    maxToolCallsPerTool = DEFAULT_MAX_TOOL_CALLS_PER_TOOL,
+    adaptiveMaxSteps = false,
     compressMaxChars = DEFAULT_COMPRESS_MAX_CHARS,
     compressToolResult,
     stopConditions = [],
@@ -340,6 +361,13 @@ export class AgentLoop {
     this.maxTaskTimeoutMs = maxTaskTimeoutMs;
     this.toolRetry = { ...DEFAULT_TOOL_RETRY, ...toolRetry };
     this.maxConsecutiveToolExhaustion = maxConsecutiveToolExhaustion;
+    this.maxToolCallsPerTool = maxToolCallsPerTool;
+    this.adaptiveMaxSteps = adaptiveMaxSteps && typeof adaptiveMaxSteps === 'object'
+      ? {
+          max: Number.isFinite(adaptiveMaxSteps.max) && adaptiveMaxSteps.max > 0 ? adaptiveMaxSteps.max : this.maxSteps * 4,
+          growthFactor: Number.isFinite(adaptiveMaxSteps.growthFactor) && adaptiveMaxSteps.growthFactor > 1 ? adaptiveMaxSteps.growthFactor : 2,
+        }
+      : false;
     this.compressMaxChars = compressMaxChars;
     this.compressToolResult = compressToolResult || defaultCompressToolResult;
     this.requireApprovalFor = requireApprovalFor;
@@ -348,11 +376,14 @@ export class AgentLoop {
     this.onEvent = onEvent || (() => {});
 
     this._toolCallHistory = []; // recent tool_call fingerprints, for stuck-loop detection
+    this._toolCallCounts = {}; // per-tool call counter for the tool-overuse guard
+    this._similarCallHistory = []; // normalized fingerprints of recent calls, for similarity warnings
     this._stepMemory = []; // structured, non-chat record of every step — see LOOP.md StepRecord
     this._consecutiveToolExhaustion = 0;
     this._pauseRequested = false;
     this._currentStep = 0;
     this._lastStartedAt = Date.now();
+    this._lastBudget = null; // effective step budget of the most recent run/resume
 
     // --- Checkpoint Manager ------------------------------------------------
     // Every checkpoint() call is also handed to this manager so a caller can
@@ -515,7 +546,10 @@ export class AgentLoop {
       createdAt: Date.now(),
       step,
       elapsedMs,
+      budget: this._lastBudget ?? null, // effective adaptive budget, so resume keeps it
       toolCallHistory: this._toolCallHistory.slice(),
+      toolCallCounts: { ...this._toolCallCounts },
+      similarCallHistory: this._similarCallHistory.slice(),
       stepMemory: this.getStepMemory(),
       consecutiveToolExhaustion: this._consecutiveToolExhaustion,
       context: this.context.toJSON(),
@@ -556,7 +590,11 @@ export class AgentLoop {
     return this._execute({
       userInput: runOpts.additionalInput ?? null,
       runOpts,
-      resumeFrom: { step: checkpointObj.step || 0, elapsedMs: checkpointObj.elapsedMs || 0 },
+      resumeFrom: {
+        step: checkpointObj.step || 0,
+        elapsedMs: checkpointObj.elapsedMs || 0,
+        budget: checkpointObj.budget ?? null,
+      },
     });
   }
 
@@ -588,6 +626,7 @@ export class AgentLoop {
       resumeFrom: {
         step: checkpointObj.step || 0,
         elapsedMs: checkpointObj.elapsedMs || 0,
+        budget: checkpointObj.budget ?? null,
         pendingApproval: checkpointObj.pendingApproval,
         approved: !!approved,
         rejectReason: runOpts.reason,
@@ -600,7 +639,10 @@ export class AgentLoop {
     this.context.restore(checkpointObj.context);
     this._stepMemory = Array.isArray(checkpointObj.stepMemory) ? checkpointObj.stepMemory.slice() : [];
     this._toolCallHistory = Array.isArray(checkpointObj.toolCallHistory) ? checkpointObj.toolCallHistory.slice() : [];
+    this._toolCallCounts = checkpointObj.toolCallCounts && typeof checkpointObj.toolCallCounts === 'object' ? { ...checkpointObj.toolCallCounts } : {};
+    this._similarCallHistory = Array.isArray(checkpointObj.similarCallHistory) ? checkpointObj.similarCallHistory.slice() : [];
     this._consecutiveToolExhaustion = checkpointObj.consecutiveToolExhaustion || 0;
+    this._lastBudget = checkpointObj.budget ?? null;
     this._pauseRequested = false;
   }
 
@@ -633,6 +675,23 @@ export class AgentLoop {
     );
   }
 
+  /**
+   * Detect near-duplicate calls: same tool with args that normalize to the
+   * same JSON (object key order ignored), appearing anywhere in the recent
+   * window — but NOT the immediately-previous call (that exact consecutive
+   * repeat is the stuck-loop guard's job). Returns true when a warning is
+   * worth emitting; the loop records the call regardless.
+   */
+  _isSimilarCall(action) {
+    const norm = `${action.tool}:${normalizeArgs(action.args)}`;
+    const prev = this._similarCallHistory[this._similarCallHistory.length - 1];
+    if (prev === norm) return false; // consecutive exact repeat -> stuck guard territory
+    const seenEarlier = this._similarCallHistory.slice(0, -1).includes(norm);
+    this._similarCallHistory.push(norm);
+    if (this._similarCallHistory.length > DEFAULT_SIMILAR_WINDOW) this._similarCallHistory.shift();
+    return seenEarlier;
+  }
+
   /** Structured, non-chat record of every step this run has executed so far. See LOOP.md StepRecord. */
   getStepMemory() {
     return this._stepMemory.slice();
@@ -661,6 +720,13 @@ export class AgentLoop {
     // A pendingApproval checkpoint pauses BEFORE its action ran, so that
     // action's step number is still "owed" — resume there, not step+1.
     const startStep = isResume ? (resumeFrom.pendingApproval ? resumeFrom.pendingApproval.step : resumeFrom.step + 1) : 1;
+    // Step budget: per-call override > resumed adaptive budget > constructor.
+    // With adaptiveMaxSteps the budget GROWS while the run makes progress
+    // (see the extension block at the end of the loop body), so a 40-step
+    // task is not cut off by a 12-step default ceiling.
+    const requestedBudget = Number.isFinite(runOpts.maxSteps) && runOpts.maxSteps > 0 ? runOpts.maxSteps : this.maxSteps;
+    let budget = isResume && Number.isFinite(resumeFrom.budget) && resumeFrom.budget > 0 ? resumeFrom.budget : requestedBudget;
+    this._lastBudget = budget;
     // The first loop iteration of a resumeWithApproval() call has its Action
     // already decided (approved/rejected) rather than produced by THINK.
     let pendingAction = isResume && resumeFrom.pendingApproval
@@ -676,6 +742,8 @@ export class AgentLoop {
 
     if (!isResume) {
       this._toolCallHistory = [];
+      this._toolCallCounts = {};
+      this._similarCallHistory = [];
       this._stepMemory = [];
       this._consecutiveToolExhaustion = 0;
     }
@@ -694,12 +762,14 @@ export class AgentLoop {
       userInput,
       startStep,
       maxSteps: this.maxSteps,
+      budget,
+      adaptiveMaxSteps: this.adaptiveMaxSteps ? this.adaptiveMaxSteps.max : false,
       maxTaskTimeoutMs: this.maxTaskTimeoutMs,
       usedTokens: this.context.usedTokens,
       maxTokens: this.context.maxTokens,
     });
 
-    for (let step = startStep; step <= this.maxSteps; step += 1) {
+    for (let step = startStep; step <= budget; step += 1) {
       this._currentStep = step;
       const elapsedMs = Date.now() - startedAt;
 
@@ -799,6 +869,33 @@ export class AgentLoop {
           log.error('step:stuck_loop', { step, tool: action.tool, args: action.args, error: msg });
           this._safeTransition(LoopState.FAILED, { reason: 'stuck_loop' });
           return this._terminate({ status: 'error', reason: TerminationReason.STUCK_LOOP, step, startedAt, extra: { error: msg } });
+        }
+
+        // --- LOOP SAFETY: tool-overuse guard (anti "tool misuse") ----------
+        // Counts every call per tool NAME for the whole run — different args
+        // count, so flailing on one tool (endless search variants) is capped
+        // while a legitimate multi-step build is not.
+        this._toolCallCounts[action.tool] = (this._toolCallCounts[action.tool] || 0) + 1;
+        if (this._toolCallCounts[action.tool] > this.maxToolCallsPerTool) {
+          const msg = `Tool "${action.tool}" has been called ${this._toolCallCounts[action.tool]} times this run (limit ${this.maxToolCallsPerTool}) - stopping instead of burning tokens on repeated use of one tool.`;
+          await this.context.append({ role: 'system', content: `[loop guard] ${msg}` });
+          this._recordStep({ step, phase: 'tool_overuse', action, error: msg, durationMs: 0 });
+          this._emit(LoopEvents.TOOL_OVERUSE, { step, tool: action.tool, calls: this._toolCallCounts[action.tool], error: msg });
+          log.error('step:tool_overuse', { step, tool: action.tool, calls: this._toolCallCounts[action.tool], error: msg });
+          this._safeTransition(LoopState.FAILED, { reason: 'tool_overuse' });
+          return this._terminate({ status: 'error', reason: TerminationReason.TOOL_OVERUSE, step, startedAt, extra: { error: msg } });
+        }
+
+        // --- LOOP SAFETY: similar-call warning (repetitive pattern) --------
+        // Not terminal — a warning the reasoner sees so it can pivot instead
+        // of re-issuing near-identical calls (same tool, args identical after
+        // key normalization, not the exact consecutive repeat stuck-guard
+        // already handles).
+        if (this._isSimilarCall(action)) {
+          const msg = `This tool call (${action.tool} ${JSON.stringify(action.args ?? {})}) closely matches an earlier call this run - check whether you already have this data before calling again.`;
+          await this.context.append({ role: 'system', content: `[loop guard] ${msg}` });
+          this._emit(LoopEvents.SIMILAR_CALL, { step, tool: action.tool, args: action.args, error: msg });
+          log.warn('step:similar_call', { step, tool: action.tool, args: action.args });
         }
 
         // --- LIFECYCLE: tool approval gate ---------------------------------
@@ -908,13 +1005,26 @@ export class AgentLoop {
           extra: { error: msg },
         });
       }
+
+      // --- ADAPTIVE BUDGET: a step just completed without terminating ---
+      // If the run is still producing actions and the budget is exhausted,
+      // grow it (up to the adaptive cap) instead of cutting the run short.
+      // Stuck/timed-out/failed runs never reach this point, so the growth
+      // only rewards actual progress.
+      if (step >= budget && this.adaptiveMaxSteps && budget < this.adaptiveMaxSteps.max) {
+        const nextBudget = Math.min(this.adaptiveMaxSteps.max, Math.round(budget * this.adaptiveMaxSteps.growthFactor));
+        this._emit(LoopEvents.BUDGET_EXTENDED, { from: budget, to: nextBudget, step });
+        log.info('run:budget_extended', { from: budget, to: nextBudget, step });
+        budget = nextBudget;
+        this._lastBudget = budget;
+      }
     }
 
-    this._emit(LoopEvents.MAX_STEPS, { steps: this.maxSteps });
-    log.warn('run:max_steps', { steps: this.maxSteps });
-    await this.context.append({ role: 'system', content: `[loop guard] Reached max steps (${this.maxSteps}) without a final answer.` });
+    this._emit(LoopEvents.MAX_STEPS, { steps: budget });
+    log.warn('run:max_steps', { steps: budget, maxSteps: this.maxSteps });
+    await this.context.append({ role: 'system', content: `[loop guard] Reached max steps (${budget}) without a final answer.` });
     this._safeTransition(LoopState.COMPLETED, { reason: 'max_steps' });
-    return this._terminate({ status: 'max_steps', reason: TerminationReason.MAX_STEPS, step: this.maxSteps, startedAt });
+    return this._terminate({ status: 'max_steps', reason: TerminationReason.MAX_STEPS, step: budget, startedAt, extra: { budget } });
   }
 
   /**
@@ -973,6 +1083,7 @@ export class AgentLoop {
       reason,
       steps: step,
       elapsedMs,
+      budget: this._lastBudget ?? this.maxSteps, // effective step budget used (adaptive aware)
       stepMemory: this.getStepMemory(),
       state: this.state.current,
       checkpoint: this.checkpoint({ step, elapsedMs, pendingApproval: extra.pendingApproval || null, reason: status }),
@@ -1054,6 +1165,26 @@ function safeStringify(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Stable JSON serialization of tool args: object keys sorted recursively. */
+function normalizeArgs(args) {
+  if (args === null || args === undefined) return '{}';
+  try {
+    return JSON.stringify(sortKeys(args));
+  } catch (_err) {
+    return String(args);
+  }
+}
+
+function sortKeys(value) {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = sortKeys(value[key]);
+    return out;
+  }
+  return value;
 }
 
 /** Adapt a legacy `(state) => reason|null` stop condition to the Stop Condition Engine's richer contract. */

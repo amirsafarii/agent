@@ -33,7 +33,7 @@ test.after(() => {
   global.fetch = originalFetch;
 });
 
-test('buildAgent: wires the full stack with the four default tools and memory', () => {
+test('buildAgent: wires the full stack with the 20 default tools and memory', () => {
   global.fetch = async () =>
     new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }), { status: 200 });
 
@@ -41,15 +41,39 @@ test('buildAgent: wires the full stack with the four default tools and memory', 
   assert.ok(agent instanceof AgentLoop);
   assert.ok(agent.context instanceof ContextWindow);
   assert.ok(agent.tools instanceof ToolRegistry);
-  assert.deepEqual(
-    agent.tools.list().map((t) => t.name).sort(),
-    ['read_file', 'shell', 'web_search', 'write_file']
-  );
+  const toolNames = agent.tools.list().map((t) => t.name).sort();
+  assert.deepEqual(toolNames, [
+    'code_run',
+    'code_test',
+    'code_validate',
+    'copy_file',
+    'delete_file',
+    'edit_file',
+    'list_dir',
+    'make_dir',
+    'move_file',
+    'npm',
+    'package_info',
+    'package_install',
+    'read_file',
+    'search_files',
+    'shell',
+    'shell_kill',
+    'shell_spawn',
+    'shell_which',
+    'web_search',
+    'write_file',
+  ]);
+  assert.equal(agent.tools.get('delete_file').requiresApproval, true, 'delete_file is approval-gated');
+  assert.equal(agent.tools.get('shell_kill').requiresApproval, true, 'shell_kill is approval-gated');
   assert.equal(agent.sessionId, 'smoke-1');
   assert.equal(agent.memoryBackend, 'in-process', 'memory on by default, in-process without Redis');
   assert.ok(agent.systemPrompt.includes('ScrappyAi'), 'built-in system prompt resolved');
+  assert.match(agent.systemPrompt, /Fallback Rule/, 'fallback rule is in the system prompt');
   assert.ok(agent.reasoner.getHistory, 'reasoner exposes history');
   assert.ok(agent.checkpoints, 'checkpoint manager attached');
+  assert.deepEqual(agent.adaptiveMaxSteps, { growthFactor: 2, max: 48 }, 'adaptive step budget on by default (12 base, 48 cap)');
+  assert.equal(agent.maxToolCallsPerTool, 8, 'tool-overuse guard on by default');
 });
 
 test('buildAgent: runs one full turn end to end through the real 9router client', async () => {
@@ -138,7 +162,13 @@ test('createDefaultToolRegistry: registers into an existing registry too', () =>
   const registry = new ToolRegistry();
   const out = createDefaultToolRegistry({ registry });
   assert.equal(out, registry);
-  assert.equal(registry.list().length, 4);
+  assert.equal(registry.list().length, 20);
+  const names = registry.list().map((t) => t.name);
+  for (const expected of ['edit_file', 'list_dir', 'search_files', 'make_dir', 'move_file', 'copy_file', 'delete_file',
+    'shell_spawn', 'shell_kill', 'shell_which', 'code_run', 'code_test', 'code_validate',
+    'npm', 'package_install', 'package_info', 'read_file', 'write_file', 'shell', 'web_search']) {
+    assert.ok(names.includes(expected), `tool ${expected} registered`);
+  }
 });
 
 test('minimal wiring: raw reasoner function + ToolRegistry + ContextWindow (README quickstart)', async () => {

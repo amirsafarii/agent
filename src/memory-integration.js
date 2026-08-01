@@ -33,16 +33,55 @@ export function wireMemory(agent, { memoryManager, extractor, userId = 'local', 
 
   const resolvedSessionId = sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const originalRun = agent.run.bind(agent);
+  const originalResume = typeof agent.resume === 'function' ? agent.resume.bind(agent) : null;
+  const originalResumeWithApproval = typeof agent.resumeWithApproval === 'function' ? agent.resumeWithApproval.bind(agent) : null;
+
+  // Emit memory observability through the agent's CURRENT onEvent — which may
+  // have been wrapped after buildAgent (e.g. by attachSessionLogger) — so
+  // memory_inject/memory_learned/memory_error land in the same session log as
+  // every loop event instead of bypassing it.
+  const emitEvent = (event, payload) => emit(agent.onEvent || onEvent, event, payload);
 
   agent.run = async (userInput, runOpts) => {
-    await injectRelevantMemory({ agent, memoryManager, userId, sessionId: resolvedSessionId, projectId, query: userInput, onEvent });
+    await injectRelevantMemory({ agent, memoryManager, userId, sessionId: resolvedSessionId, projectId, query: userInput, onEvent: emitEvent });
 
     const outcome = await originalRun(userInput, runOpts);
 
-    await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput, outcome, onEvent });
+    await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput, outcome, onEvent: emitEvent });
 
     return outcome;
   };
+
+  // Paused/approval runs go through resume()/resumeWithApproval(), not run().
+  // Wrap those too so an approved continuation still gets memory injection
+  // before and turn recording after — otherwise a /approve in the REPL would
+  // silently skip memory for the rest of the run.
+  if (originalResume) {
+    agent.resume = async (checkpointObj, runOpts = {}) => {
+      const query = runOpts.additionalInput || null;
+      if (query) {
+        await injectRelevantMemory({ agent, memoryManager, userId, sessionId: resolvedSessionId, projectId, query, onEvent: emitEvent });
+      }
+      const outcome = await originalResume(checkpointObj, runOpts);
+      if (query) {
+        await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
+      }
+      return outcome;
+    };
+  }
+  if (originalResumeWithApproval) {
+    agent.resumeWithApproval = async (checkpointObj, approved, runOpts = {}) => {
+      const query = runOpts.additionalInput || null;
+      if (query) {
+        await injectRelevantMemory({ agent, memoryManager, userId, sessionId: resolvedSessionId, projectId, query, onEvent: emitEvent });
+      }
+      const outcome = await originalResumeWithApproval(checkpointObj, approved, runOpts);
+      if (query) {
+        await recordTurn({ memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId, userInput: query, outcome, onEvent: emitEvent });
+      }
+      return outcome;
+    };
+  }
 
   agent.memory = { memoryManager, extractor, userId, sessionId: resolvedSessionId, projectId };
   return agent;
