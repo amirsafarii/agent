@@ -7,10 +7,26 @@
  *   import { ToolRegistry, createFilesystemTools, createShellTool, ... } from 'src/tools/index.js';
  *
  * Implementation lives in focused sibling modules: registry.js (ToolRegistry),
- * filesystem.js / shell.js / code.js / package.js / planning.js /
- * verification.js (tool suites), search.js (web search).
+ * lifecycle.js (tool lifecycle states + metadata), filesystem.js / shell.js /
+ * code.js / package.js / planning.js / verification.js (tool suites),
+ * search.js (web search).
  */
-export { ToolRegistry, ToolError } from './registry.js';
+export {
+  ToolRegistry,
+  ToolError,
+  ToolLifecycle,
+  createToolMetadata,
+  transitionLifecycle,
+  promoteToActive,
+  canTransitionLifecycle,
+  EXECUTABLE_LIFECYCLES,
+  SCHEMA_LIFECYCLES,
+} from './registry.js';
+export {
+  ToolLifecycle as Lifecycle,
+  createToolMetadata as toolMetadata,
+  promoteToActive as promoteTool,
+} from './lifecycle.js';
 export { createFilesystemTools } from './filesystem.js';
 export { createShellTool, createShellSpawnTool, createShellKillTool, createShellWhichTool } from './shell.js';
 export { createCodeTools } from './code.js';

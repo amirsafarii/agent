@@ -58,24 +58,53 @@ export function createPackageTools(opts = {}) {
     return resolved;
   }
 
-  async function runNpm(argv, { cwd = root, timeout } = {}) {
+  async function runNpm(argv, { cwd = root, timeout, signal, ignoreScripts = false } = {}) {
     const startedAt = Date.now();
-    log.info('npm:run_start', { argv, cwd, timeout });
+    const finalArgv = ignoreScripts && !argv.includes('--ignore-scripts')
+      ? [...argv, '--ignore-scripts']
+      : argv;
+    log.info('npm:run_start', { argv: finalArgv, cwd, timeout, ignoreScripts });
     try {
-      const result = await execa('npm', argv, { cwd, timeout, reject: false, env: cleanSpawnEnv(), extendEnv: false });
+      const result = await execa('npm', finalArgv, {
+        cwd,
+        timeout,
+        reject: false,
+        env: cleanSpawnEnv(),
+        extendEnv: false,
+        cancelSignal: signal,
+        killSignal: 'SIGTERM',
+      });
       const output = {
-        command: `npm ${argv.join(' ')}`,
+        command: `npm ${finalArgv.join(' ')}`,
         exitCode: result.exitCode ?? null,
         timedOut: !!result.timedOut,
         stdout: truncate(result.stdout, maxOutputChars),
         stderr: truncate(result.stderr, maxOutputChars),
+        ignoreScripts,
       };
-      log.info('npm:run_done', { argv, durationMs: Date.now() - startedAt, exitCode: output.exitCode, timedOut: output.timedOut });
+      log.info('npm:run_done', { argv: finalArgv, durationMs: Date.now() - startedAt, exitCode: output.exitCode, timedOut: output.timedOut });
       return output;
     } catch (err) {
-      log.error('npm:run_failed', { argv, durationMs: Date.now() - startedAt, error: err.message });
-      throw pkgError(`Failed to run npm ${argv.join(' ')}: ${err.message}`, err.code || 'NPM_ERROR');
+      log.error('npm:run_failed', { argv: finalArgv, durationMs: Date.now() - startedAt, error: err.message });
+      throw pkgError(`Failed to run npm ${finalArgv.join(' ')}: ${err.message}`, err.code || 'NPM_ERROR');
     }
+  }
+
+  /**
+   * Lifecycle scripts (postinstall etc.) are a code-execution vector.
+   * Default SAFE: always ignore scripts unless the sandbox is DANGEROUS
+   * (admin profile) AND package permission is "allow".
+   * developer/autonomous get package installs but with --ignore-scripts.
+   */
+  function shouldIgnoreScripts(ctx = {}) {
+    const granted = ctx.permissions || {};
+    if (granted.package === 'no_scripts' || granted.package === 'none') return true;
+    if (ctx.sandbox && typeof ctx.sandbox.allowLifecycleScripts === 'function') {
+      return !ctx.sandbox.allowLifecycleScripts(granted);
+    }
+    // Without a sandbox handle: only allow scripts for an explicit package:allow
+    // from an admin-like caller. Still default to ignore.
+    return true;
   }
 
   const npmTool = {
@@ -88,12 +117,18 @@ export function createPackageTools(opts = {}) {
       cwd: { type: 'string', description: 'Working directory (defaults to the sandbox root).' },
       timeoutMs: { type: 'number', description: `Per-call timeout override (default ${timeoutMs}ms).` },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
+      if (ctx.signal?.aborted) throw pkgError('aborted', 'ABORTED');
       const argv = splitCommand(String(args.args || '').trim());
       if (argv.length === 0) throw pkgError('Empty npm arguments.', 'EMPTY_ARGS');
       const cwd = args.cwd ? resolveSafe(args.cwd) : root;
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
-      return runNpm(argv, { cwd, timeout: runTimeout });
+      return runNpm(argv, {
+        cwd,
+        timeout: runTimeout,
+        signal: ctx.signal,
+        ignoreScripts: shouldIgnoreScripts(ctx),
+      });
     },
   };
 
@@ -101,7 +136,8 @@ export function createPackageTools(opts = {}) {
     name: 'package_install',
     description:
       'Install npm dependencies in the sandbox: no packages -> "npm install" (uses package.json/lockfile); ' +
-      'with packages -> "npm install <pkg...>". dev:true adds -D, force:true adds --force. Network required.',
+      'with packages -> "npm install <pkg...>". dev:true adds -D, force:true adds --force. Network required. ' +
+      'Lifecycle scripts are DISABLED by default (security) unless the permission profile grants package:"allow".',
     parameters: {
       packages: { type: 'array', description: 'Package specifiers to install, e.g. ["express"] or ["-D", "vitest"].' },
       dev: { type: 'boolean', description: 'Install as devDependencies (-D). Default false.' },
@@ -109,7 +145,10 @@ export function createPackageTools(opts = {}) {
       cwd: { type: 'string', description: 'Working directory (defaults to the sandbox root).' },
       timeoutMs: { type: 'number', description: `Per-call timeout override (default ${timeoutMs}ms).` },
     },
-    handler: async (args) => {
+    requiresApproval: true,
+    risk: 'high',
+    handler: async (args, ctx = {}) => {
+      if (ctx.signal?.aborted) throw pkgError('aborted', 'ABORTED');
       const cwd = args.cwd ? resolveSafe(args.cwd) : root;
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
       const argv = ['install'];
@@ -117,7 +156,14 @@ export function createPackageTools(opts = {}) {
       if (args.dev) argv.push('-D');
       if (args.force) argv.push('--force');
       argv.push(...packages);
-      return runNpm(argv, { cwd, timeout: runTimeout });
+      // Security: malicious packages can RCE via postinstall. Default to --ignore-scripts
+      // unless the active profile explicitly allows lifecycle scripts.
+      return runNpm(argv, {
+        cwd,
+        timeout: runTimeout,
+        signal: ctx.signal,
+        ignoreScripts: shouldIgnoreScripts(ctx),
+      });
     },
   };
 

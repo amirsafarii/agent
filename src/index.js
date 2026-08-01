@@ -38,6 +38,8 @@ import { PlanningEngine } from './planning/index.js';
 import { VerificationEngine } from './verification/index.js';
 import { createMemory } from './memory/index.js';
 import { wireMemory } from './memory/integration.js';
+import { resolveProfile, ApprovalManager } from './security/permissions.js';
+import { createSandbox, levelFromPermissions } from './security/sandbox.js';
 import { randomUUID } from 'node:crypto';
 
 const log = createLogger('index');
@@ -155,15 +157,39 @@ export function loadSystemPrompt(override) {
  * @param {string} [opts.filesRoot] sandbox root for all file/shell/code/package tools,
  *        default process.env.SCRAPPYAI_FILES_ROOT || cwd
  * @param {string} [opts.shellCwd]
+ * @param {string|Object} [opts.profile='developer'] permission profile
+ *   (readonly | developer | autonomous | admin)
+ * @param {import('./security/sandbox.js').Sandbox} [opts.sandbox]
+ * @param {import('./security/permissions.js').ApprovalManager} [opts.approvals]
  * @returns {import('./tools/registry.js').ToolRegistry}
  */
 export function createDefaultToolRegistry(opts = {}) {
-  const registry = opts.registry || new ToolRegistry();
   const filesRoot = opts.filesRoot || process.env.SCRAPPYAI_FILES_ROOT || process.cwd();
-  const shellOpts = { cwd: opts.shellCwd, sandboxRoot: filesRoot };
+  const profile = resolveProfile(opts.profile || process.env.SCRAPPYAI_PERMISSION_PROFILE || 'developer');
+  const sandbox = opts.sandbox || createSandbox({
+    rootDir: filesRoot,
+    level: levelFromPermissions(profile.permissions),
+    allowSymlinksOutside: profile.permissions.filesystem === 'host',
+  });
+  const approvals = opts.approvals || new ApprovalManager();
 
-  // filesystem suite (9 tools, incl. read_file/write_file)
-  for (const def of createFilesystemTools({ rootDir: filesRoot })) registry.register(def);
+  const registry = opts.registry || new ToolRegistry({
+    profile,
+    sandbox,
+    filesRoot,
+    approvals,
+  });
+  // If caller passed a pre-built registry, still align profile/sandbox.
+  if (opts.registry) {
+    registry.setProfile?.(profile);
+    registry.sandbox = sandbox;
+    registry.approvals = approvals;
+  }
+
+  const shellOpts = { cwd: opts.shellCwd || filesRoot, sandboxRoot: filesRoot };
+
+  // filesystem suite (9 tools, incl. read_file/write_file) — realpath sandbox
+  for (const def of createFilesystemTools({ rootDir: filesRoot, sandbox })) registry.register(def);
 
   // shell suite (4 tools)
   registry.register(createShellTool(shellOpts));
@@ -174,7 +200,7 @@ export function createDefaultToolRegistry(opts = {}) {
   // code suite (3 tools)
   for (const def of createCodeTools({ rootDir: filesRoot })) registry.register(def);
 
-  // package suite (3 tools)
+  // package suite (3 tools) — lifecycle scripts gated by sandbox level
   for (const def of createPackageTools({ rootDir: filesRoot })) registry.register(def);
 
   // planning suite (4 tools)
@@ -205,11 +231,18 @@ export function createDefaultToolRegistry(opts = {}) {
  *        scopes session (turn-by-turn) memory; a new process gets a new session by default.
  * @param {string} [opts.projectId] defaults to SCRAPPYAI_PROJECT_ID env or null — scopes project memory.
  * @param {boolean} [opts.memory] pass false to force-disable memory for this instance regardless of env.
+ * @param {string|Object} [opts.profile='developer'] permission profile (readonly|developer|autonomous|admin)
  * @returns {AgentLoop}
  */
 export function buildAgent(opts = {}) {
   const systemPrompt = loadSystemPrompt(opts.systemPrompt);
-  const tools = opts.tools || createDefaultToolRegistry();
+  const profileName = opts.profile || process.env.SCRAPPYAI_PERMISSION_PROFILE || 'developer';
+  const tools = opts.tools || createDefaultToolRegistry({
+    profile: profileName,
+    filesRoot: opts.filesRoot,
+    planningEngine: opts.planningEngine,
+    verificationEngine: opts.verificationEngine,
+  });
   const context =
     opts.context ||
     new ContextWindow({
@@ -249,7 +282,10 @@ export function buildAgent(opts = {}) {
     onEvent: opts.onEvent,
     requireApprovalFor: opts.requireApprovalFor ?? parseApprovalEnv(),
     onToolApproval: opts.onToolApproval,
+    onPlanApproval: opts.onPlanApproval,
     lifecycleHooks: opts.lifecycleHooks,
+    approvals: tools.approvals,
+    parallelConcurrency: opts.parallelConcurrency || Number(process.env.SCRAPPYAI_PARALLEL_CONCURRENCY) || 4,
     checkpointDir: opts.checkpointDir ?? (process.env.SCRAPPYAI_CHECKPOINT_DIR
       ? `${process.env.SCRAPPYAI_CHECKPOINT_DIR}/${sessionId}`
       : undefined),
@@ -378,5 +414,31 @@ export {
   PlanningEngine,
   VerificationEngine,
 };
+
+export {
+  resolveProfile,
+  ApprovalManager,
+  PROFILES,
+  PermissionValue,
+  RiskLevel,
+  checkPermissions,
+} from './security/permissions.js';
+export { createSandbox, Sandbox, SandboxLevel } from './security/sandbox.js';
+export {
+  Task,
+  TaskStatus,
+  Run,
+  ParallelExecutor,
+  parallel,
+  DAG,
+  DAGExecutor,
+  TaskTree,
+  GoalDecomposer,
+} from './planning/index.js';
+export {
+  ToolLifecycle,
+  ToolRegistry,
+  ToolError,
+} from './tools/index.js';
 
 export default buildAgent;

@@ -105,7 +105,17 @@ export function createReasoner({ client, systemPrompt, maxRetries = DEFAULT_MAX_
     return `call_${Date.now()}_${callCounter}`;
   }
 
-  async function reasoner(renderedContext, toolSchema) {
+  /**
+   * @param {Array} renderedContext
+   * @param {Array} toolSchema
+   * @param {{ signal?: AbortSignal }} [opts] end-to-end cancellation from agent.run()
+   */
+  async function reasoner(renderedContext, toolSchema, opts = {}) {
+    const signal = opts && opts.signal;
+    if (signal && signal.aborted) {
+      throw new ReasonerError('Reasoner aborted via AbortSignal.', 'ABORTED');
+    }
+
     // Seed native history from ContextWindow's render() on the very first
     // call (or if the reasoner was attached mid-run), so we never talk to
     // the model with a blank slate just because addUser() wasn't called yet.
@@ -159,6 +169,7 @@ export function createReasoner({ client, systemPrompt, maxRetries = DEFAULT_MAX_
               systemPrompt,
               messages: history,
               tools: toolSchema,
+              signal,
               onDelta: (delta) => {
                 if (delta && delta.type === 'content' && tokenSink) {
                   try {
@@ -169,7 +180,7 @@ export function createReasoner({ client, systemPrompt, maxRetries = DEFAULT_MAX_
                 }
               },
             })
-          : await client.chat({ systemPrompt, messages: history, tools: toolSchema });
+          : await client.chat({ systemPrompt, messages: history, tools: toolSchema, signal });
         const action = normalize(raw);
         log.info('chat:done', {
           attempt,
