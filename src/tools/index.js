@@ -34,5 +34,6 @@ export { createPackageTools } from './package.js';
 export { createPlanningTools } from './planning.js';
 export { createVerificationTools } from './verification.js';
 export { createWebSearchTool } from './search.js';
+export { createHttpTools } from './http.js';
 
 export { ToolRegistry as default } from './registry.js';

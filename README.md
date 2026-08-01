@@ -37,6 +37,13 @@ src/
 │                              task-tree, dag-executor (parallel waves)
 ├── verification/           ← engine.js (VerificationEngine) + verification-pipeline,
 │                              validators
+├── evaluation/             ← Evaluation / Critic layer: think→act→observe→evaluate→
+│                              continue/repair/finish (EvaluationEngine), Goal completion
+│                              detector (GoalState), Evidence/provenance (evidenceOf)
+├── budget/                 ← BudgetManager: tokens/model/tool/network/subprocess/
+│                              runtime/dollars ledger, per-task scopes
+├── artifacts/              ← ArtifactManager: file/code/test/report/patch artifacts
+│                              with checksums, versions, snapshot & rollback
 └── memory/                 ← seven-layer memory (session/workspace/episodic/semantic/
 │                              long-term/tool/project), in-process or Redis
 └── integration.js          ← [memory] injection before each turn, recording after
@@ -58,6 +65,58 @@ tests/
 docs/
 └── LOOP.md                 ← full loop input/output schema (states, actions, results)
 ```
+
+## Evaluation, evidence, budget & artifacts
+
+Beyond the think → act → observe loop, ScrappyAi ships a critic stage, a goal
+completion detector, provenance, a cost/budget manager, an artifact ledger, and
+patch-based editing — each optional and backward-compatible:
+
+```js
+import {
+  buildAgent, EvaluationEngine, GoalState, BudgetManager, ArtifactManager,
+} from './src/index.js';
+```
+
+- **Evaluation / Critic** — `EvaluationEngine().evaluate({goal, action, observation, expected, verification})`
+  returns `{success, confidence, reason, next}` where `next ∈ continue|repair|finish`.
+  A default deterministic critic never hallucinates a pass: a claim only counts
+  as success when verification evidence backs it up. Pass a custom `critic`
+  (e.g. an LLM judgement) to override it. Wire it into the loop:
+  `new AgentLoop({ evaluator })` — after each observe the verdict is emitted as
+  an `evaluate` event, and a `repair` verdict steers the reasoner to retry
+  instead of drifting into a low-confidence "final".
+- **Verification vs Evaluation** stay separate: `src/verification/` is the
+  deterministic layer (file exists? test passes? JSON valid? exit code 0?),
+  `src/evaluation/` is the reasoned layer. Verification results carry an
+  `evidence` provenance record.
+- **Goal completion detector** — `GoalState({goal, requirements})` tracks each
+  requirement as satisfied/unsatisfied with evidence. Attach it via
+  `new AgentLoop({ goalState })`; the final result then carries `goal.isSatisfied`
+  plus per-requirement evidence, so "final" means "proven".
+- **Evidence / provenance** — `evidenceOf(claim, [{type, command, output}])`.
+  "Verified: npm test → 152 passed" instead of "I think it works".
+- **Budget manager** — `new BudgetManager({maxTokens, maxModelCalls, maxToolCalls,
+  maxNetworkCalls, maxSubprocesses, maxRuntimeMs, maxDollars})`. `scope(taskId)`
+  spawns a per-task child bounded by the parent's remaining allowance. Wired into
+  the loop: `new AgentLoop({ budgetManager })` stops the run with reason
+  `budget_exceeded` when any limit is hit.
+- **Artifact system** — `new ArtifactManager({rootDir})`. `register({type, path,
+  taskId, createdBy, content|data})` computes a sha256 checksum and version;
+  `snapshot()`/`rollback()` enable checkpoint & rollback. Attach via
+  `new AgentLoop({ artifactManager })` to surface artifacts on the final result.
+- **Patch-based editing** — `apply_patch({file, hunks:[{old, new}], verify})`
+  read → validate → apply atomically → (optionally) verify. The whole patch is
+  rejected (`VALIDATION_ERROR`) if any hunk matches ≠ exactly once, so nothing
+  is ever half-applied.
+- **HTTP tools** — `http_get`, `http_post`, `http_request` with per-call timeout,
+  max response size (truncation-flagged), an allowed-domains allowlist, and a
+  bounded manual redirect limit. Typed failures: `{code:'TIMEOUT'|'DOMAIN_BLOCKED'|
+  'HTTP_STATUS'|'TOO_MANY_REDIRECTS', errorInfo:{code, message, retryable}}`.
+- **Typed tool results & tool contracts** — every tool result carries `meta
+  {durationMs, source, truncated}`; failures carry `errorInfo {code, message,
+  retryable}`. `registry.toolContract(name)` returns `{name, version, inputSchema,
+  outputSchema, description}`.
 
 ## Run tests
 

@@ -39,6 +39,8 @@ export const LoopEvents = Object.freeze({
   TOOL_OVERUSE: 'tool_overuse',
   SIMILAR_CALL: 'similar_call',
   BUDGET_EXTENDED: 'budget_extended',
+  EVALUATE: 'evaluate',
+  BUDGET_EXCEEDED: 'budget_exceeded',
 });
 
 /**
@@ -57,6 +59,7 @@ export const TerminationReason = Object.freeze({
   ABORTED: 'aborted_by_signal',
   THINK_ERROR: 'think_phase_error',
   INVALID_ACTION: 'invalid_action',
+  BUDGET_EXCEEDED: 'budget_exceeded',
   PAUSED: 'paused_by_request',
   AWAITING_TOOL_APPROVAL: 'awaiting_tool_approval',
 });

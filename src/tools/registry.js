@@ -480,18 +480,27 @@ export class ToolRegistry {
         runCtx.signal
       );
       const durationMs = Date.now() - startedAt;
-      const result = { ok: true, data, durationMs };
+      const truncated = !!(data && typeof data === 'object' && data.truncated === true);
+      const result = {
+        ok: true,
+        data,
+        durationMs, // legacy top-level field, kept for compatibility
+        meta: { durationMs, source: name, truncated },
+      };
       recordExecutionMetrics(tool, result);
       log.info('execute:done', { name, args, ok: true, output: data, durationMs, lifecycle: tool.lifecycle });
       return result;
     } catch (err) {
       const durationMs = Date.now() - startedAt;
       const code = (err && err.code) || 'TOOL_EXECUTION_ERROR';
+      const message = err && err.message ? err.message : String(err);
       const result = {
         ok: false,
-        error: err && err.message ? err.message : String(err),
+        error: message,
         code,
         durationMs,
+        meta: { durationMs, source: name, truncated: false },
+        errorInfo: buildErrorInfo(code, message),
       };
       recordExecutionMetrics(tool, result);
       log.error('execute:done', {
@@ -568,6 +577,8 @@ export class ToolRegistry {
       name: def.name,
       description: def.description || '',
       parameters: def.parameters || {},
+      inputSchema: def.inputSchema || def.parameters || {},
+      outputSchema: def.outputSchema || null,
       handler: def.handler,
       timeoutMs: def.timeoutMs || DEFAULT_TIMEOUT_MS,
       requiresApproval: !!def.requiresApproval || risk === 'critical',
@@ -585,12 +596,64 @@ export class ToolRegistry {
       error,
       code,
       durationMs: Date.now() - startedAt,
+      meta: { durationMs: Date.now() - startedAt, source: name, truncated: false },
+      errorInfo: buildErrorInfo(code, error),
       ...extra,
     };
     log.warn('execute:done', { name, args, ok: false, code, error, durationMs: result.durationMs });
     return result;
   }
+
+  /**
+   * Inspect a tool's versioned contract: name, semantic version, and
+   * input/output schemas. If a tool changes, its schema version bumps so a
+   * caller can tell which contract it's talking to.
+   * @param {string} name
+   * @returns {{name:string, version:string, inputSchema:Object, outputSchema:Object, description:string}|null}
+   */
+  toolContract(name) {
+    const tool = this._tools.get(name);
+    if (!tool) return null;
+    return {
+      name: tool.name,
+      version: tool.metadata?.version || '0.0.0',
+      inputSchema: tool.inputSchema || tool.parameters || {},
+      outputSchema: tool.outputSchema || {},
+      description: tool.description || '',
+    };
+  }
+
+  /** @returns {Array<{name:string, version:string}>} all tool contracts (name + version) */
+  listContracts() {
+    return [...this._tools.values()].map((t) => ({
+      name: t.name,
+      version: t.metadata?.version || '0.0.0',
+    }));
+  }
 }
+
+/**
+ * Build the structured errorInfo {code, message, retryable} attached to every
+ * failed tool result. `retryable` is true only for generic execution errors
+ * and transient transport failures — not for validation, permission, or
+ * domain/redirect errors that a retry can never fix.
+ */
+function buildErrorInfo(code, message) {
+  const retryable = RETRYABLE_ERROR_CODES.has(code);
+  return { code, message, retryable };
+}
+
+/** Codes a retry can plausibly fix. */
+const RETRYABLE_ERROR_CODES = new Set([
+  'TOOL_EXECUTION_ERROR',
+  'EXECUTION_ERROR',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'REQUEST_FAILED',
+  'TIMEOUT',
+]);
 
 /**
  * Run fn() with a timeout AND AbortSignal. Aborting rejects with code ABORTED;
