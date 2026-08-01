@@ -71,22 +71,31 @@ export function createShellTool(opts = {}) {
       },
     },
     timeoutMs: timeoutMs + 2_000, // registry-level guard slightly above execa's own timeout
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
       const commandLine = String(args.command || '').trim();
       if (!commandLine) {
         throw shellError('Empty command.', 'EMPTY_COMMAND');
       }
+      if (ctx.signal?.aborted) throw shellError('aborted', 'ABORTED');
 
       const [bin, ...rest] = splitCommand(commandLine);
 
-      if (deny.includes(bin)) {
+      // Permission-aware policy:
+      //   shell:none        → tool permission gate already rejected the call
+      //   shell:restricted  → denylist + optional allowlist enforced; useShell allowed
+      //   shell:allow       → denylist skipped (admin/dangerous)
+      const granted = ctx.permissions || {};
+      const unrestricted = granted.shell === 'allow' || (ctx.sandbox && ctx.sandbox.allowUnrestrictedShell?.(granted));
+
+      if (!unrestricted && deny.includes(bin)) {
         throw shellError(`Binary "${bin}" is denied by shell tool policy.`, 'DENIED_BINARY');
       }
       if (Array.isArray(allow) && !allow.includes(bin)) {
         throw shellError(`Binary "${bin}" is not in the shell tool allowlist.`, 'NOT_ALLOWLISTED');
       }
 
-      const runCwd = resolveRunCwd(args.cwd, cwd, sandboxRoot);
+      const effectiveRoot = ctx.sandbox?.root || sandboxRoot;
+      const runCwd = resolveRunCwd(args.cwd, cwd, effectiveRoot);
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
       const startedAt = Date.now();
       log.info('shell:start', { command: commandLine, cwd: runCwd, timeoutMs: runTimeout, useShell: !!args.useShell });
@@ -101,6 +110,9 @@ export function createShellTool(opts = {}) {
           // `node --test` silently no-ops if it inherits NODE_TEST_CONTEXT.
           env: cleanSpawnEnv(),
           extendEnv: false,
+          // End-to-end cancellation: AbortSignal kills the child process.
+          cancelSignal: ctx.signal,
+          killSignal: 'SIGTERM',
         });
 
         const output = {
@@ -157,20 +169,32 @@ export function createShellSpawnTool(opts = {}) {
       command: { type: 'string', required: true, description: 'Full command line, e.g. "node server.js --port 4000".' },
       cwd: { type: 'string', description: 'Working directory override.' },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
       const commandLine = String(args.command || '').trim();
       if (!commandLine) throw shellError('Empty command.', 'EMPTY_COMMAND');
+      if (ctx.signal?.aborted) throw shellError('aborted', 'ABORTED');
       const [bin, ...rest] = splitCommand(commandLine);
       if (deny.includes(bin)) throw shellError(`Binary "${bin}" is denied by shell tool policy.`, 'DENIED_BINARY');
       if (Array.isArray(allow) && !allow.includes(bin)) {
         throw shellError(`Binary "${bin}" is not in the shell tool allowlist.`, 'NOT_ALLOWLISTED');
       }
-      const runCwd = resolveRunCwd(args.cwd, cwd, sandboxRoot);
+      const effectiveRoot = ctx.sandbox?.root || sandboxRoot;
+      const runCwd = resolveRunCwd(args.cwd, cwd, effectiveRoot);
 
       log.info('shell_spawn:start', { command: commandLine, cwd: runCwd });
       const child = spawn(bin, rest, { cwd: runCwd, detached: true, stdio: 'ignore', env: cleanSpawnEnv() });
       child.unref(); // let the agent process exit without waiting for the child
       spawnedRegistry.set(child.pid, { pid: child.pid, command: commandLine, startedAt: Date.now() });
+
+      // If the parent run is aborted later, best-effort kill the child too.
+      if (ctx.signal) {
+        const onAbort = () => {
+          try { process.kill(child.pid, 'SIGTERM'); } catch (_err) { /* already dead */ }
+          spawnedRegistry.delete(child.pid);
+        };
+        ctx.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
       const output = { pid: child.pid, command: commandLine, cwd: runCwd, note: 'background process started; use shell_kill to stop it' };
       log.info('shell_spawn:done', { pid: child.pid, command: commandLine });
       return output;

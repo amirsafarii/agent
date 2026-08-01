@@ -68,7 +68,7 @@ export function createNineRouterClient(opts = {}) {
   const endpoint = new URL('chat/completions', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
 
   return {
-    async chat({ systemPrompt, messages, tools }) {
+    async chat({ systemPrompt, messages, tools, signal }) {
       const body = {
         model,
         temperature,
@@ -98,7 +98,7 @@ export function createNineRouterClient(opts = {}) {
         apiKey: '[REDACTED]',
       });
 
-      const res = await post(endpoint, body, { timeoutMs, startedAt, apiKey });
+      const res = await post(endpoint, body, { timeoutMs, startedAt, signal, apiKey });
       const rawText = await safeText(res);
       const payload = parseJsonResponse(rawText);
       const response = fromOpenAiResponse(payload);

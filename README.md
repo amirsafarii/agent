@@ -7,7 +7,8 @@ src/
 ├── index.js                ← buildAgent() wiring: tools + 9router + memory + session log
 ├── core/
 │   ├── loop/               ← the heart: think → act → observe (AgentLoop)
-│   │   ├── agent-loop.js      orchestrator: guards, retry, adaptive budget, approval gate
+│   │   ├── agent-loop.js      orchestrator: guards, retry, adaptive budget, approval gate,
+│   │   │                      Run≠Task, parallel tool_calls, end-to-end AbortSignal
 │   │   ├── state-machine.js   LoopState + LoopStateMachine (audited transitions)
 │   │   ├── stop-conditions.js prioritized Stop Condition Engine
 │   │   ├── events.js          LoopEvents / TerminationReason / ActionType
@@ -15,7 +16,7 @@ src/
 │   │   └── compression.js     tool-result compression + shared helpers
 │   ├── context.js          ← context window: token budget + auto-compaction (ContextWindow)
 │   ├── reasoner.js         ← pluggable LLM adapter + native tool_call_id history,
-│   │                          + streaming (createReasoner)
+│   │                          + streaming (createReasoner) + AbortSignal → HTTP
 │   ├── checkpoint-manager.js ← every checkpoint addressable by id, in memory + on disk
 │   ├── session-logger.js   ← per-session events.jsonl + transcript.log on disk
 │   ├── trace.js            ← Claude-Code-style colored terminal trace + scratchpad renderer
@@ -23,11 +24,17 @@ src/
 │   └── repl.js             ← multi-turn REPL (/help /history /scratchpad /system /reset
 │                              /approve /deny /exit)
 ├── clients/9router.js      ← OpenAI-compatible chat + chatStream (SSE) adapter
+├── security/
+│   ├── permissions.js      ← permission axes + profiles (readonly/developer/autonomous/admin)
+│   │                          + ApprovalManager (tool/plan/step/session grants)
+│   └── sandbox.js          ← realpath-based containment (blocks symlink escapes)
 ├── tools/
-│   ├── registry.js         ← tool registry: validation, timeout, safe errors (ToolRegistry)
+│   ├── registry.js         ← lifecycle-aware ToolRegistry (DISCOVERED→…→ACTIVE→REMOVED)
+│   ├── lifecycle.js        ← ToolLifecycle states + metadata + metrics
 │   └── {filesystem,shell,code,package,planning,verification,search}.js
-├── planning/               ← engine.js (PlanningEngine) + DAG, goal-decomposer,
-│                              task-tree, dag-executor
+├── planning/               ← engine.js (PlanningEngine) + task.js (Task/Run) +
+│                              parallel-executor.js + DAG, goal-decomposer,
+│                              task-tree, dag-executor (parallel waves)
 ├── verification/           ← engine.js (VerificationEngine) + verification-pipeline,
 │                              validators
 └── memory/                 ← seven-layer memory (session/workspace/episodic/semantic/
@@ -57,7 +64,7 @@ docs/
 ```
 npm test
 ```
-(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **152 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools.)
+(equivalent to `node --test`, uses Node's built-in test runner — no extra deps. **182 tests, all green** — the suite exercises real subprocess/filesystem behavior and stubs only `fetch` for the network tools. Includes lifecycle, permissions, realpath sandbox, Task/Run, parallel executor, and end-to-end AbortSignal coverage.)
 
 ## Wiring it together
 
@@ -216,14 +223,92 @@ outside the root are rejected before any fs call:
 
 **web**: `web_search` (`tools/search.js`) — SearXNG JSON API (`SEARXNG_BASE_URL`), all documented params, results capped (default 8).
 
-### Sandbox
+### Sandbox + permissions
 
 Everything file-shaped (filesystem, code, package, shell `cwd`) is confined
-to one root — `SCRAPPYAI_FILES_ROOT` (defaults to the working directory).
-`read_file`/`write_file` keep their legacy names; the full suite lives in
-`tools/filesystem.js`. Destructive tools (`delete_file`, `shell_kill`) are
-approval-gated out of the box; add more via `SCRAPPYAI_REQUIRE_APPROVAL`
-(comma list or `*`) or `buildAgent({ requireApprovalFor })`.
+to one root — `SCRAPPYAI_FILES_ROOT` (defaults to the working directory) via
+**realpath-based** containment (`security/sandbox.js`). A symlink inside the
+sandbox that points at `/etc` is rejected (`SYMLINK_ESCAPE`) before any read.
+
+Permission profiles (`SCRAPPYAI_PERMISSION_PROFILE` or `buildAgent({ profile })`):
+
+| Profile | FS | Network | Shell | Package scripts |
+|---|---|---|---|---|
+| `readonly` | readonly | ✓ | ✗ | ✗ |
+| `developer` (default) | sandbox | ✓ | restricted | install w/ `--ignore-scripts` |
+| `autonomous` | sandbox | ✓ | restricted | install w/ `--ignore-scripts` |
+| `admin` | host | ✓ | allow | lifecycle scripts allowed |
+
+Destructive tools (`delete_file`, `shell_kill`, `package_install`) are
+approval-gated out of the box. Approval is multi-level:
+
+```js
+agent.approveToolForSession('shell');   // this tool, rest of session
+agent.approvePlan(planId);              // whole plan
+agent.approveStep(planId, taskId);      // one step
+// or denyToolForSession('shell')
+```
+
+Also: `SCRAPPYAI_REQUIRE_APPROVAL` (comma list or `*`) /
+`buildAgent({ requireApprovalFor, onToolApproval, onPlanApproval })`.
+
+### Tool lifecycle + metadata
+
+Tools are no longer a bare `register → execute`. Every tool walks:
+
+```
+DISCOVERED → DRAFT → VALIDATING → TESTING → APPROVED
+  → REGISTERED → ACTIVE → DEPRECATED → REMOVED
+```
+
+`register()` promotes builtins to `ACTIVE` automatically. Only `ACTIVE`
+tools are advertised to the reasoner; `DEPRECATED` still runs (with a
+warning); anything else is rejected with `TOOL_NOT_ACTIVE`. Each tool
+carries metadata (`version`, `author`, `tags`, `category`, `risk`,
+`permissions`, `sideEffects`, execution metrics).
+
+### Run ≠ Task + parallel execution
+
+A **Run** is one `agent.run()` invocation. A **Task** is a unit of work
+inside it (goal, status, deps, inputs/outputs, attempts, artifacts,
+subtasks). Plans attach Tasks to the active Run.
+
+Independent work runs concurrently:
+
+```js
+import { parallel } from './src/planning/index.js';
+
+await parallel([taskA, taskB, taskC], {
+  concurrency: 4,
+  signal,            // AbortSignal
+  timeoutMs: 30_000, // overall
+  taskTimeoutMs: 10_000,
+  onError: 'collect', // fail-fast | continue | collect
+  retry: { retries: 2, backoffMs: 100 },
+});
+```
+
+The reasoner can also emit a parallel tool batch:
+
+```js
+{ type: 'tool_call', tools: [
+  { tool: 'web_search', args: { q: 'A' } },
+  { tool: 'web_search', args: { q: 'B' } },
+  { tool: 'web_search', args: { q: 'C' } },
+]}
+```
+
+### End-to-end cancellation
+
+`agent.run(input, { signal })` propagates `AbortSignal` all the way down:
+
+```
+agent.run → AgentLoop → reasoner → HTTP (9router)
+                     → ToolRegistry.execute → handler(args, { signal, context, logger, task, permissions, sandbox, tool })
+                                            → child_process (execa cancelSignal) / fetch
+```
+
+Every tool handler receives the same rich context object.
 
 ### Agent-logic safeguards (loop.js)
 
@@ -491,17 +576,15 @@ Covered by `tests/streaming.test.js` (10 tests) plus the SSE-recovery tests in
 
 ## Status
 
-Implemented and tested (**140 tests, `node --test`, all green**): `AgentLoop` (state machine,
+Implemented and tested (**182 tests, `node --test`, all green**): `AgentLoop` (state machine,
 stop-condition engine, adaptive step budget, tool-overuse + similar-call guards,
-checkpoints/pause/resume, tool-approval gate, lifecycle hooks), `ToolRegistry`, `ContextWindow`,
-`createReasoner` (with the turn-memory system-message sync), the **20-tool default registry**
-(filesystem suite, shell exec/spawn/kill/which, code run/test/validate, package npm/install/
-package_info, web_search), the `9router` client (chat + chatStream), the seven-layer memory
-system with in-process auto-fallback + local-pattern fact extraction, checkpoint/session-log/
-trace/REPL layers, and `index.js` wiring. `shell`/`files`/`code` tests exercise real
-subprocess/filesystem behavior; `search` and `9router` tests stub `fetch` (no live network
-dependency in the suite, even though the SearXNG endpoint was manually verified live and
-returns real results).
+checkpoints/pause/resume, multi-level approval gate, Run≠Task, parallel tool_calls,
+end-to-end AbortSignal, lifecycle hooks), lifecycle-aware `ToolRegistry` + metadata,
+permission profiles + realpath sandbox, `ContextWindow`, `createReasoner` (turn-memory
+sync + signal), the **28-tool default registry** (filesystem/shell/code/package/planning/
+verification/web), `ParallelExecutor` + parallel DAG waves, the `9router` client
+(chat + chatStream), seven-layer memory, checkpoint/session-log/trace/REPL, and
+`index.js` wiring.
 
 ## Memory between turns — what was fixed
 

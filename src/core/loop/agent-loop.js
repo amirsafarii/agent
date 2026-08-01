@@ -35,6 +35,9 @@ import { LoopError } from './errors.js';
 import { LoopState, LoopStateMachine, statusToLoopState } from './state-machine.js';
 import { StopConditionEngine, wrapLegacyStopCondition } from './stop-conditions.js';
 import { DEFAULT_COMPRESS_MAX_CHARS, defaultCompressToolResult, normalizeArgs, sleep, serializeError } from './compression.js';
+import { Run } from '../../planning/task.js';
+import { parallel as parallelExec } from '../../planning/parallel-executor.js';
+import { ApprovalManager } from '../../security/permissions.js';
 
 const log = createLogger('loop');
 
@@ -103,7 +106,11 @@ export class AgentLoop {
    * @param {string} [opts.checkpointDir] Convenience: persist this loop's checkpoints to disk under
    *        this directory (passed straight to `new CheckpointManager({ dir })`) when no
    *        `checkpointManager` override is given.
+   * @param {ApprovalManager} [opts.approvals] session-scoped tool/plan/step approval grants
+   * @param {number} [opts.parallelConcurrency=4] default concurrency for parallel tool_calls
    * @param {Function} [opts.onEvent] - (event, payload) => void observability hook.
+   * @param {Function} [opts.onPlanApproval] optional async (plan) => boolean|{approved,reason}
+   *        for plan-level approval (in addition to tool-level).
    */
   constructor({
     context,
@@ -122,9 +129,12 @@ export class AgentLoop {
     namedStopConditions = {},
     requireApprovalFor = [],
     onToolApproval,
+    onPlanApproval,
     lifecycleHooks = {},
     checkpointManager,
     checkpointDir,
+    approvals,
+    parallelConcurrency = 4,
     onEvent,
   } = {}) {
     if (!context) throw new LoopError('AgentLoop requires a ContextWindow instance ("context").');
@@ -150,8 +160,13 @@ export class AgentLoop {
     this.compressToolResult = compressToolResult || defaultCompressToolResult;
     this.requireApprovalFor = requireApprovalFor;
     this.onToolApproval = typeof onToolApproval === 'function' ? onToolApproval : null;
+    this.onPlanApproval = typeof onPlanApproval === 'function' ? onPlanApproval : null;
     this.lifecycleHooks = lifecycleHooks || {};
+    this.approvals = approvals || (tools && tools.approvals) || new ApprovalManager();
+    this.parallelConcurrency = Number.isFinite(parallelConcurrency) ? parallelConcurrency : 4;
     this.onEvent = onEvent || (() => {});
+    /** @type {Run|null} current Run (separate from Task) */
+    this.currentRun = null;
 
     this._toolCallHistory = []; // recent tool_call fingerprints, for stuck-loop detection
     this._toolCallCounts = {}; // per-tool call counter for the tool-overuse guard
@@ -280,14 +295,54 @@ export class AgentLoop {
 
   /**
    * Whether a tool_call to `toolName` must go through the AWAITING_TOOL_APPROVAL
-   * gate: either this loop's `requireApprovalFor` says so, or the tool's own
-   * definition (`requiresApproval: true`, see tools/registry.js) does.
+   * gate. Layers (any true → gate):
+   *   1. session denial
+   *   2. requireApprovalFor list / '*'
+   *   3. tool.requiresApproval
+   *   4. permission-profile risk threshold (via ToolRegistry.requiresApproval)
+   * Session grants short-circuit to false ("approve this tool for this session").
    */
-  _requiresApproval(toolName) {
+  _requiresApproval(toolName, request = {}) {
+    const session = this.approvals.lookup({ tool: toolName, ...request });
+    if (session === 'granted') return false;
+    if (session === 'denied') return true;
+
     if (this.requireApprovalFor === '*') return true;
     if (Array.isArray(this.requireApprovalFor) && this.requireApprovalFor.includes(toolName)) return true;
+
+    // Prefer the registry's combined check (tool flag + profile risk threshold).
+    if (typeof this.tools.requiresApproval === 'function') {
+      return this.tools.requiresApproval(toolName, request);
+    }
     const def = typeof this.tools.get === 'function' ? this.tools.get(toolName) : null;
     return !!(def && def.requiresApproval);
+  }
+
+  /**
+   * Approve a tool for the rest of this session (no more prompts).
+   * @param {string} toolName
+   */
+  approveToolForSession(toolName) {
+    this.approvals.approveToolForSession(toolName);
+    return this;
+  }
+
+  /** Deny a tool for the rest of this session. */
+  denyToolForSession(toolName) {
+    this.approvals.denyToolForSession(toolName);
+    return this;
+  }
+
+  /** Approve an entire plan id. */
+  approvePlan(planId) {
+    this.approvals.approvePlan(planId);
+    return this;
+  }
+
+  /** Approve one step of a plan. */
+  approveStep(planId, taskId) {
+    this.approvals.approveStep(planId, taskId);
+    return this;
   }
 
   /** Current state (see LoopState). */
@@ -333,6 +388,7 @@ export class AgentLoop {
       context: this.context.toJSON(),
       state: this.state.current,
       pendingApproval: meta.pendingApproval || null,
+      runId: meta.runId || this.currentRun?.id || null,
     };
     // Fire-and-forget: the CheckpointManager index is best-effort convenience
     // (list/get-by-id later); a slow/broken disk write must never block or
@@ -513,8 +569,11 @@ export class AgentLoop {
           tool: resumeFrom.pendingApproval.tool,
           args: resumeFrom.pendingApproval.args,
           reasoning: resumeFrom.pendingApproval.reasoning,
+          // Multi-tool parallel batch may be pending too.
+          tools: resumeFrom.pendingApproval.tools,
           _approvalDecision: resumeFrom.approved,
           _approvalRejectReason: resumeFrom.rejectReason,
+          _approvalScope: resumeFrom.pendingApproval.scope || 'tool',
         }
       : null;
 
@@ -524,6 +583,20 @@ export class AgentLoop {
       this._similarCallHistory = [];
       this._stepMemory = [];
       this._consecutiveToolExhaustion = 0;
+      // Fresh Run — separate concept from Task. One run() == one Run.
+      this.currentRun = new Run({
+        input: userInput != null ? String(userInput) : null,
+        sessionId: runOpts.sessionId || this.sessionId || null,
+        metadata: { maxSteps: budget },
+      });
+      this.currentRun.start();
+    } else if (!this.currentRun) {
+      this.currentRun = new Run({
+        id: resumeFrom.runId || undefined,
+        input: userInput != null ? String(userInput) : null,
+        sessionId: runOpts.sessionId || this.sessionId || null,
+      });
+      this.currentRun.start();
     }
     this._pauseRequested = false;
     this._lastStartedAt = startedAt;
@@ -538,6 +611,7 @@ export class AgentLoop {
     }
     log.info(isResume ? 'run:continue' : 'run:start', {
       userInput,
+      runId: this.currentRun?.id,
       startStep,
       maxSteps: this.maxSteps,
       budget,
@@ -588,7 +662,8 @@ export class AgentLoop {
         try {
           const rendered = this.context.render();
           const toolSchema = this.tools.toSchema();
-          action = await this.reasoner(rendered, toolSchema);
+          // End-to-end cancellation: signal reaches the reasoner → HTTP client.
+          action = await this.reasoner(rendered, toolSchema, { signal });
           this._validateAction(action);
         } catch (err) {
           this._emit(LoopEvents.ERROR, { step, phase: 'think', error: serializeError(err) });
@@ -728,13 +803,32 @@ export class AgentLoop {
         log.info('step:tool_approval_granted', { step, tool: action.tool, viaResume: true });
       }
       this._safeTransition(LoopState.ACTING);
-      await this.context.addToolCall(action.tool, action.args, { reasoning: action.reasoning });
-      this._emit(LoopEvents.ACT, { step, tool: action.tool, args: action.args });
-      log.info('step:act', { step, tool: action.tool, args: action.args });
+
+      // Parallel tool_calls: action.tools = [{tool, args}, ...] (independent).
+      const isParallel = Array.isArray(action.tools) && action.tools.length > 0;
+      if (isParallel) {
+        await this.context.addToolCall(
+          action.tools.map((t) => t.tool).join('+'),
+          { parallel: action.tools },
+          { reasoning: action.reasoning }
+        );
+        this._emit(LoopEvents.ACT, { step, parallel: true, tools: action.tools.map((t) => t.tool) });
+        log.info('step:act', { step, parallel: true, tools: action.tools.map((t) => t.tool) });
+      } else {
+        await this.context.addToolCall(action.tool, action.args, { reasoning: action.reasoning });
+        this._emit(LoopEvents.ACT, { step, tool: action.tool, args: action.args });
+        log.info('step:act', { step, tool: action.tool, args: action.args });
+      }
 
       const retryPolicy = { ...this.toolRetry, ...(action.retry || {}) };
       const actStartedAt = Date.now();
-      const { result, attempts } = await this._executeWithRetry(action, retryPolicy, { step, signal });
+      let result;
+      let attempts;
+      if (isParallel) {
+        ({ result, attempts } = await this._executeParallel(action.tools, retryPolicy, { step, signal }));
+      } else {
+        ({ result, attempts } = await this._executeWithRetry(action, retryPolicy, { step, signal }));
+      }
       const actDurationMs = Date.now() - actStartedAt;
 
       if (!result.ok && attempts > retryPolicy.retries) {
@@ -746,7 +840,8 @@ export class AgentLoop {
       // --- OBSERVE -----------------------------------------------------
       this._safeTransition(LoopState.OBSERVING);
       const compressed = this.compressToolResult(result, { maxChars: this.compressMaxChars });
-      await this.context.addToolResult(action.tool, compressed, { attempts });
+      const observeTool = isParallel ? action.tools.map((t) => t.tool).join('+') : action.tool;
+      await this.context.addToolResult(observeTool, compressed, { attempts });
       if (typeof this.reasoner.addToolResult === 'function') {
         this.reasoner.addToolResult(action._toolCallId, compressed);
       }
@@ -758,10 +853,10 @@ export class AgentLoop {
         attempts,
         durationMs: actDurationMs,
       });
-      this._emit(LoopEvents.OBSERVE, { step, tool: action.tool, result, attempts, durationMs: actDurationMs });
+      this._emit(LoopEvents.OBSERVE, { step, tool: observeTool, result, attempts, durationMs: actDurationMs });
       log.info('step:observe', {
         step,
-        tool: action.tool,
+        tool: observeTool,
         ok: result.ok,
         attempts,
         output: result.ok ? result.data : result.error,
@@ -810,14 +905,32 @@ export class AgentLoop {
    * Only codes listed in `policy.retryableCodes` are retried; anything else
    * (e.g. VALIDATION_ERROR, UNKNOWN_TOOL) fails fast on attempt 1 since a
    * retry can't fix a malformed call.
+   *
+   * Handler context is fully populated so cancellation + task + permissions
+   * propagate end-to-end:
+   *   handler(args, { signal, context, logger, task, permissions, sandbox, tool })
+   *
    * @returns {Promise<{result: ToolResult, attempts: number}>} attempts = number of tries actually made (>=1)
    */
   async _executeWithRetry(action, policy, { step, signal }) {
     let attempt = 0;
     let lastResult;
+    const runCtx = {
+      signal,
+      context: this.context,
+      task: null,
+      // Ambient run identity so tools can attribute artifacts.
+      run: this.currentRun,
+    };
     while (true) {
       attempt += 1;
-      lastResult = await this.tools.execute(action.tool, action.args, { signal });
+      if (signal && signal.aborted) {
+        return {
+          result: { ok: false, error: 'aborted', code: 'ABORTED', durationMs: 0 },
+          attempts: attempt,
+        };
+      }
+      lastResult = await this.tools.execute(action.tool, action.args, runCtx);
       if (lastResult.ok) return { result: lastResult, attempts: attempt };
 
       const isRetryable = (policy.retryableCodes || []).includes(lastResult.code);
@@ -829,6 +942,69 @@ export class AgentLoop {
       log.warn('step:tool_retry', { step, tool: action.tool, attempt, backoffMs, code: lastResult.code, error: lastResult.error });
       if (backoffMs > 0) await sleep(backoffMs);
     }
+  }
+
+  /**
+   * Execute several independent tool calls concurrently.
+   *   await executor.parallel([taskA, taskB, taskC])
+   * Partial failure policy: collect (all settle); overall ok only if every
+   * call succeeded. Cancellation via the shared AbortSignal.
+   * @param {Array<{tool:string, args?:object}>} calls
+   * @returns {Promise<{result: ToolResult, attempts: number}>}
+   */
+  async _executeParallel(calls, policy, { step, signal }) {
+    const concurrency = this.parallelConcurrency;
+    this._emit(LoopEvents.ACT, { step, phase: 'parallel_start', count: calls.length, concurrency });
+
+    const summary = await parallelExec(
+      calls.map((c) => async ({ signal: s }) => {
+        const { result, attempts } = await this._executeWithRetry(
+          { tool: c.tool, args: c.args || {}, retry: c.retry },
+          policy,
+          { step, signal: s }
+        );
+        if (!result.ok) {
+          const err = new Error(result.error || `tool ${c.tool} failed`);
+          err.code = result.code;
+          err.toolResult = result;
+          err.attempts = attempts;
+          throw err;
+        }
+        return { tool: c.tool, args: c.args, result, attempts };
+      }),
+      {
+        concurrency,
+        signal,
+        onError: 'collect',
+      }
+    );
+
+    const attempts = Math.max(1, ...summary.results.map((r) => r.attempts || 1));
+    const data = {
+      parallel: true,
+      total: summary.total,
+      completedCount: summary.completedCount,
+      failedCount: summary.failedCount,
+      cancelledCount: summary.cancelledCount,
+      results: summary.results.map((r, i) => {
+        if (r.ok) return { ok: true, tool: calls[i].tool, data: r.data.result?.data ?? r.data, attempts: r.attempts, durationMs: r.durationMs };
+        return { ok: false, tool: calls[i].tool, error: r.error, code: r.code, attempts: r.attempts, durationMs: r.durationMs };
+      }),
+    };
+
+    if (summary.ok) {
+      return { result: { ok: true, data, durationMs: summary.durationMs }, attempts };
+    }
+    return {
+      result: {
+        ok: false,
+        error: `Parallel tool batch: ${summary.failedCount} failed, ${summary.cancelledCount} cancelled of ${summary.total}.`,
+        code: summary.aborted ? 'ABORTED' : 'PARALLEL_PARTIAL_FAILURE',
+        data,
+        durationMs: summary.durationMs,
+      },
+      attempts,
+    };
   }
 
   _recordStep(record) {
@@ -856,6 +1032,20 @@ export class AgentLoop {
    */
   _terminate({ status, reason, step, startedAt, extra = {} }) {
     const elapsedMs = Date.now() - startedAt;
+
+    // Close out the Run (separate from any Tasks it owns).
+    if (this.currentRun) {
+      if (status === 'final' || status === 'need_clarification' || status === 'max_steps') {
+        this.currentRun.complete();
+      } else if (status === 'aborted') {
+        this.currentRun.abort(reason || 'aborted');
+      } else if (status === 'paused' || status === 'awaiting_tool_approval') {
+        // leave running — will resume
+      } else if (status === 'error' || status === 'stopped') {
+        this.currentRun.fail(extra.error || reason || status);
+      }
+    }
+
     return {
       status,
       reason,
@@ -864,7 +1054,15 @@ export class AgentLoop {
       budget: this._lastBudget ?? this.maxSteps, // effective step budget used (adaptive aware)
       stepMemory: this.getStepMemory(),
       state: this.state.current,
-      checkpoint: this.checkpoint({ step, elapsedMs, pendingApproval: extra.pendingApproval || null, reason: status }),
+      runId: this.currentRun?.id || null,
+      run: this.currentRun ? this.currentRun.toJSON() : null,
+      checkpoint: this.checkpoint({
+        step,
+        elapsedMs,
+        pendingApproval: extra.pendingApproval || null,
+        reason: status,
+        runId: this.currentRun?.id,
+      }),
       ...extra,
     };
   }
@@ -890,8 +1088,26 @@ export class AgentLoop {
         }
         return;
       case ActionType.TOOL_CALL:
+        // Parallel form: { type:'tool_call', tools:[{tool,args}, ...] }
+        if (Array.isArray(action.tools) && action.tools.length > 0) {
+          for (const t of action.tools) {
+            if (!t || typeof t.tool !== 'string' || !t.tool.trim()) {
+              throw new LoopError('Each parallel tool_call entry requires non-empty string "tool".', 'INVALID_ACTION');
+            }
+            if (!this.tools.has(t.tool)) {
+              throw new LoopError(`"tool_call" references unknown tool "${t.tool}".`, 'INVALID_ACTION');
+            }
+            if (t.args !== undefined && (typeof t.args !== 'object' || t.args === null || Array.isArray(t.args))) {
+              throw new LoopError('"tool_call" args must be a plain object when provided.', 'INVALID_ACTION');
+            }
+          }
+          // Convenience: surface the first tool name for stuck-loop / overuse guards.
+          if (!action.tool) action.tool = action.tools[0].tool;
+          if (!action.args) action.args = { parallel: action.tools.map((t) => t.tool) };
+          return;
+        }
         if (typeof action.tool !== 'string' || !action.tool.trim()) {
-          throw new LoopError('"tool_call" action requires non-empty string "tool".', 'INVALID_ACTION');
+          throw new LoopError('"tool_call" action requires non-empty string "tool" (or tools:[]).', 'INVALID_ACTION');
         }
         if (!this.tools.has(action.tool)) {
           throw new LoopError(`"tool_call" references unknown tool "${action.tool}".`, 'INVALID_ACTION');

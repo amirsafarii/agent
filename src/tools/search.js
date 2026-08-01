@@ -56,9 +56,10 @@ export function createWebSearchTool(opts = {}) {
       time_range: { type: 'string', enum: VALID_TIME_RANGES, description: 'Restrict by recency.' },
       safesearch: { type: 'number', enum: VALID_SAFESEARCH, description: '0 = off, 1 = moderate, 2 = strict.' },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
       const query = String(args.q || '').trim();
       if (!query) throw searchError('Empty query.', 'EMPTY_QUERY');
+      if (ctx.signal?.aborted) throw searchError('aborted', 'ABORTED');
 
       const format = args.format || 'json';
       const params = new URLSearchParams();
@@ -75,16 +76,23 @@ export function createWebSearchTool(opts = {}) {
       const startedAt = Date.now();
       log.info('search:start', { query, format, url });
 
+      // Combine per-tool timeout with the end-to-end AbortSignal from agent.run().
       const controller = new AbortController();
+      const onOuterAbort = () => controller.abort(ctx.signal?.reason || new Error('aborted'));
+      if (ctx.signal) {
+        if (ctx.signal.aborted) controller.abort(ctx.signal.reason || new Error('aborted'));
+        else ctx.signal.addEventListener('abort', onOuterAbort, { once: true });
+      }
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let res;
       try {
         res = await fetch(url, { signal: controller.signal, headers: { Accept: 'application/json' } });
       } catch (err) {
         log.error('search:request_failed', { query, durationMs: Date.now() - startedAt, error: err.message });
-        throw searchError(`SearXNG request failed: ${err.message}`, 'REQUEST_FAILED');
+        throw searchError(`SearXNG request failed: ${err.message}`, err.name === 'AbortError' ? 'ABORTED' : 'REQUEST_FAILED');
       } finally {
         clearTimeout(timer);
+        if (ctx.signal) ctx.signal.removeEventListener('abort', onOuterAbort);
       }
 
       if (!res.ok) {

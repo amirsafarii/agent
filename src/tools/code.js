@@ -78,7 +78,7 @@ export function createCodeTools(opts = {}) {
   }
 
   /** Run argv via execa and shape the result like the shell tool does. */
-  async function run(argv, { cwd = root, timeout, label } = {}) {
+  async function run(argv, { cwd = root, timeout, label, signal } = {}) {
     const startedAt = Date.now();
     log.info('code:run_start', { label, argv, cwd, timeout });
     try {
@@ -89,6 +89,8 @@ export function createCodeTools(opts = {}) {
         shell: false,
         env: cleanSpawnEnv(),
         extendEnv: false,
+        cancelSignal: signal,
+        killSignal: 'SIGTERM',
       });
       const output = {
         command: argv.join(' '),
@@ -119,15 +121,17 @@ export function createCodeTools(opts = {}) {
       cwd: { type: 'string', description: 'Working directory for the run (defaults to the sandbox root).' },
       timeoutMs: { type: 'number', description: `Per-call timeout override (default ${timeoutMs}ms).` },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
+      if (ctx.signal?.aborted) throw codeError('aborted', 'ABORTED');
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
       const extra = Array.isArray(args.args) ? args.args.map(String) : [];
       const cwd = args.cwd ? resolveSafe(args.cwd) : root;
+      const signal = ctx.signal;
 
       if (args.path) {
         const abs = resolveSafe(args.path);
         const runner = EXT_RUNNERS[path.extname(abs).toLowerCase()] || ['node'];
-        return run([...runner, abs, ...extra], { cwd, timeout: runTimeout, label: args.path });
+        return run([...runner, abs, ...extra], { cwd, timeout: runTimeout, label: args.path, signal });
       }
       if (typeof args.code === 'string' && args.code.trim()) {
         const lang = String(args.language || 'js').toLowerCase();
@@ -135,7 +139,7 @@ export function createCodeTools(opts = {}) {
         if (!runner) {
           throw codeError(`Unsupported inline language "${args.language}" (js|ts|python|bash).`, 'UNSUPPORTED_LANGUAGE');
         }
-        return run([...runner, args.code, ...extra], { cwd, timeout: runTimeout, label: `inline ${lang}` });
+        return run([...runner, args.code, ...extra], { cwd, timeout: runTimeout, label: `inline ${lang}`, signal });
       }
       throw codeError('Provide either "path" (a code file) or "code" (inline source).', 'NO_INPUT');
     },
@@ -153,30 +157,32 @@ export function createCodeTools(opts = {}) {
       cwd: { type: 'string', description: 'Working directory (defaults to the sandbox root).' },
       timeoutMs: { type: 'number', description: `Per-call timeout override (default ${timeoutMs}ms).` },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
+      if (ctx.signal?.aborted) throw codeError('aborted', 'ABORTED');
       const runTimeout = Number.isFinite(args.timeoutMs) ? args.timeoutMs : timeoutMs;
       const cwd = args.cwd ? resolveSafe(args.cwd) : root;
+      const signal = ctx.signal;
 
       if (args.command) {
         const [bin, ...rest] = splitCommand(String(args.command).trim());
-        return run([bin, ...rest], { cwd, timeout: runTimeout, label: args.command });
+        return run([bin, ...rest], { cwd, timeout: runTimeout, label: args.command, signal });
       }
       if (args.path) {
         const abs = resolveSafe(args.path);
         const ext = path.extname(abs).toLowerCase();
-        if (ext === '.py') return run(['python3', '-m', 'pytest', abs], { cwd, timeout: runTimeout, label: args.path });
-        return run(['node', '--test', abs], { cwd, timeout: runTimeout, label: args.path });
+        if (ext === '.py') return run(['python3', '-m', 'pytest', abs], { cwd, timeout: runTimeout, label: args.path, signal });
+        return run(['node', '--test', abs], { cwd, timeout: runTimeout, label: args.path, signal });
       }
       // No explicit command/path: try the package.json "test" script, else bare node --test.
       try {
         const pkg = JSON.parse(await fs.readFile(path.join(cwd, 'package.json'), 'utf8'));
         if (pkg.scripts && typeof pkg.scripts.test === 'string') {
-          return run(['npm', 'test'], { cwd, timeout: runTimeout, label: 'npm test' });
+          return run(['npm', 'test'], { cwd, timeout: runTimeout, label: 'npm test', signal });
         }
       } catch (_err) {
         // no package.json / unparsable — fall through
       }
-      return run(['node', '--test'], { cwd, timeout: runTimeout, label: 'node --test' });
+      return run(['node', '--test'], { cwd, timeout: runTimeout, label: 'node --test', signal });
     },
   };
 

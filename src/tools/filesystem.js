@@ -23,6 +23,7 @@
 import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { createLogger } from '../core/logger.js';
+import { createSandbox } from '../security/sandbox.js';
 
 const log = createLogger('tools:filesystem');
 
@@ -35,6 +36,7 @@ const DEFAULT_MAX_SEARCH_RESULTS = 100;
 /**
  * @param {Object} [opts]
  * @param {string} [opts.rootDir] sandbox root, defaults to process.cwd()
+ * @param {import('../security/sandbox.js').Sandbox} [opts.sandbox] reuse a shared Sandbox
  * @param {number} [opts.maxReadChars]
  * @param {number} [opts.maxWriteChars]
  * @returns {Array<import('./registry.js').ToolDefinition>} nine registered-ready tool definitions
@@ -49,26 +51,24 @@ export function createFilesystemTools(opts = {}) {
     maxSearchResults = DEFAULT_MAX_SEARCH_RESULTS,
   } = opts;
 
-  const root = path.resolve(rootDir);
+  // Realpath-based sandbox: rejects symlink escapes (sandbox/link → /etc).
+  const sandbox = opts.sandbox || createSandbox({ rootDir });
+  const root = sandbox.root;
   try {
     mkdirSync(root, { recursive: true });
   } catch (_err) {}
 
   function resolveSafe(relPath) {
-    if (typeof relPath !== 'string' || !relPath.trim()) {
-      throw fileError('A non-empty "path" is required.', 'INVALID_PATH');
+    try {
+      return sandbox.resolve(relPath);
+    } catch (err) {
+      throw fileError(err.message, err.code || 'PATH_ESCAPE');
     }
-    const resolved = path.resolve(root, relPath);
-    const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
-    if (resolved !== root && !resolved.startsWith(rootWithSep)) {
-      throw fileError(`Path "${relPath}" escapes sandbox root "${root}".`, 'PATH_ESCAPE');
-    }
-    return resolved;
   }
 
   /** Resolve a path but allow the sandbox root itself as an explicit target. */
   function rel(abs) {
-    return path.relative(root, abs) || '.';
+    return sandbox.relativize(abs);
   }
 
   const readTool = {
@@ -78,8 +78,17 @@ export function createFilesystemTools(opts = {}) {
       path: { type: 'string', required: true, description: 'Path relative to sandbox root.' },
       encoding: { type: 'string', description: 'Defaults to "utf8".' },
     },
-    handler: async (args) => {
+    handler: async (args, ctx = {}) => {
+      // Use the tool's own sandbox (bound to rootDir at construction). The
+      // registry may pass a different ambient sandbox; only fall back to it
+      // when this tool was built without one. Always realpath-check.
+      if (ctx.signal?.aborted) throw fileError('aborted', 'ABORTED');
       const abs = resolveSafe(args.path);
+      try {
+        await sandbox.resolveAsync(args.path);
+      } catch (e) {
+        throw fileError(e.message, e.code || 'SYMLINK_ESCAPE');
+      }
       const encoding = args.encoding || 'utf8';
       log.info('read_file:start', { path: args.path, abs, encoding });
       let content;
